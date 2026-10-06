@@ -123,8 +123,8 @@ The final workflow was consolidated, harmonized, reviewed, and adapted for publi
 Historical development notebooks and superseded scripts are not required to execute the final workflow and are therefore not included in the public repository.
 ## License
 
-A software license must be approved by the project/institutional rights holder before public release. For this analysis-code repository, a permissive open-source license such as the **MIT License** is a suitable default candidate because it permits reuse, modification and redistribution while requiring preservation of the copyright and license notice. **BSD-3-Clause** is a similarly permissive alternative. A copyleft license such as **GPL-3.0** should be chosen only if the project explicitly wants redistributed derivative software to remain under the same license terms.
+The original analysis code in this repository is released under the MIT License.
+Copyright © 2026 Ulrike Löber and contributors.
+Permission is granted to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the software in accordance with the terms of the MIT License.
+This license applies only to original code distributed in this repository. R packages, external software, data, and other third-party resources used by the workflow remain subject to their respective licenses and terms of use.
 
-The repository license applies only to original code distributed in this repository. R packages and external software used by the workflow remain subject to their own licenses.
-
-**Before public release:** confirm the chosen license and copyright holder(s) with the relevant project/institutional process, then add the corresponding standard `LICENSE` file at the repository root.
