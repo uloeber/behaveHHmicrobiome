@@ -1,0 +1,3416 @@
+---
+title: "Gut microbiome composition and economic preferences"
+subtitle: "Reproducible analysis notebook (public-repository version; based on v5.3c)"
+author: "Behavioural microbiome manuscript team"
+date: "`r Sys.Date()`"
+params:
+  data_dir: "data"
+  output_dir: "outputs"
+  run_id: ""
+  run_maaslin: true
+  run_shotgun_species_maaslin: true
+  run_fb_ratio: true
+  run_metabolomics: true
+  maaslin_cores: 1
+  permutations: 9999
+  random_seed: 20260721
+  source_run_dir: ""
+  top_nominal_per_panel: 12
+  strict_checks: true
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    df_print: paged
+---
+
+# Purpose
+
+This stable v5.3c notebook is the single analysis source for the microbiome--economic-preferences manuscript. It consolidates the last working data-loading, alpha-diversity, PERMANOVA, MaAsLin2, taxon-figure, and metabolomics code while retaining the corrections agreed during manuscript review.
+
+It is designed to be run section by section in RStudio Server. Each section should:
+
+1. read or compute the relevant result,
+2. write reproducible output tables,
+3. write publication-ready figure files,
+4. print a short manuscript-ready interpretation.
+
+The notebook uses the cohort labels **Community cohort** and **Student cohort** throughout. Internal file names may still contain `hamburg` or `american` for compatibility with existing outputs. Species-level MaAsLin2 is restricted to the Community-cohort shotgun data; the Student-cohort 16S data are analysed at family and genus level only. The harmonized Bacillota/Bacteroidota ratio is reinstated as a secondary exploratory analysis using cohort-specific rarefied phylum tables and is retained whether its result is positive or null.
+
+For public-repository use, input data are intentionally separated from code. The repository does not contain participant-level or otherwise restricted source data. Input locations are configured via `data_dir`/`MICROBIOME_PREF_DATA`, and generated outputs are written below `outputs/`, which is excluded from version control by default.
+
+# 0. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = TRUE,
+  message = TRUE,
+  fig.width = 7,
+  fig.height = 5,
+  dpi = 300,
+  cache = FALSE
+)
+
+# R Markdown parameters are automatically available when knitting, but not
+# always when “Run All” is used interactively in RStudio Server.
+get_notebook_param <- function(name, default) {
+  if (exists("params", inherits = TRUE)) {
+    p <- get("params", inherits = TRUE)
+    if (!is.null(p[[name]])) return(p[[name]])
+  }
+  default
+}
+
+# Public-repository path handling. No institution- or user-specific paths are
+# embedded in the analysis. By default, inputs are expected under data/ and
+# outputs are written under outputs/ relative to the repository root.
+# Restricted data may instead be stored anywhere and supplied via
+# MICROBIOME_PREF_DATA=/path/to/private/data.
+PROJECT_DIR <- normalizePath(
+  Sys.getenv("MICROBIOME_PREF_PROJECT", unset = getwd()),
+  mustWork = FALSE
+)
+
+resolve_project_path <- function(path, base = PROJECT_DIR) {
+  if (is.null(path) || !nzchar(path)) return(NULL)
+  is_abs <- startsWith(path, "/") || grepl("^[A-Za-z]:", path)
+  normalizePath(if (is_abs) path else file.path(base, path), mustWork = FALSE)
+}
+
+data_param <- get_notebook_param("data_dir", "data")
+output_param <- get_notebook_param("output_dir", "outputs")
+
+DATA_DIR <- resolve_project_path(
+  Sys.getenv("MICROBIOME_PREF_DATA", unset = data_param)
+)
+OUTPUT_DIR <- resolve_project_path(
+  Sys.getenv("MICROBIOME_PREF_OUTPUT", unset = output_param)
+)
+
+RUN_ID <- get_notebook_param("run_id", "")
+if (is.null(RUN_ID) || !nzchar(RUN_ID)) RUN_ID <- format(Sys.time(), "%Y%m%d_%H%M%S")
+RUN_MAASLIN <- isTRUE(get_notebook_param("run_maaslin", TRUE))
+RUN_SPECIES_MAASLIN <- isTRUE(get_notebook_param(
+  "run_shotgun_species_maaslin",
+  get_notebook_param("run_species_maaslin", TRUE)
+))
+RUN_FB_RATIO <- isTRUE(get_notebook_param("run_fb_ratio", TRUE))
+RUN_METABOLOMICS <- isTRUE(get_notebook_param("run_metabolomics", TRUE))
+MAASLIN_CORES <- as.integer(get_notebook_param("maaslin_cores", 1L))
+PERMUTATIONS <- as.integer(get_notebook_param("permutations", 9999L))
+RANDOM_SEED <- as.integer(get_notebook_param("random_seed", 20260721L))
+set.seed(RANDOM_SEED)
+SOURCE_RUN_DIR <- get_notebook_param("source_run_dir", "")
+if (is.null(SOURCE_RUN_DIR) || !nzchar(SOURCE_RUN_DIR)) SOURCE_RUN_DIR <- NULL
+if (!is.null(SOURCE_RUN_DIR)) SOURCE_RUN_DIR <- resolve_project_path(SOURCE_RUN_DIR)
+TOP_NOMINAL_PER_PANEL <- as.integer(get_notebook_param("top_nominal_per_panel", 12L))
+STRICT_CHECKS <- isTRUE(get_notebook_param("strict_checks", TRUE))
+NOTEBOOK_VERSION <- "v5_3c_student_stage2_covariates_2026-09-23"
+PDF_DEVICE <- if (capabilities("cairo")) grDevices::cairo_pdf else grDevices::pdf
+```
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(readxl)
+  library(vegan)
+  library(broom)
+  library(janitor)
+  library(stringr)
+  library(forcats)
+  library(patchwork)
+})
+
+# MaAsLin2 is only loaded if needed because it can be slow / unavailable on some systems.
+if (RUN_MAASLIN) {
+  suppressPackageStartupMessages(library(Maaslin2))
+}
+```
+
+```{r directories}
+if (!dir.exists(DATA_DIR)) {
+  stop(
+    "DATA_DIR does not exist: ", DATA_DIR, "\n",
+    "Create data/ in the repository or set MICROBIOME_PREF_DATA to the private input-data directory.",
+    call. = FALSE
+  )
+}
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+RUN_DIR <- file.path(OUTPUT_DIR, RUN_ID)
+RESULTS_DIR <- file.path(RUN_DIR, "results")
+TABLES_DIR  <- file.path(RUN_DIR, "tables")
+FIGURES_DIR <- file.path(RUN_DIR, "figures")
+SUPP_DIR    <- file.path(RUN_DIR, "supplement")
+LOG_DIR     <- file.path(RUN_DIR, "logs")
+
+purrr::walk(
+  c(RUN_DIR, RESULTS_DIR, TABLES_DIR, FIGURES_DIR, SUPP_DIR, LOG_DIR),
+  ~ dir.create(.x, recursive = TRUE, showWarnings = FALSE)
+)
+
+cat("PROJECT_DIR:", PROJECT_DIR, "\n")
+cat("DATA_DIR:", DATA_DIR, "\n")
+cat("OUTPUT_DIR:", OUTPUT_DIR, "\n")
+cat("RUN_DIR:", RUN_DIR, "\n")
+cat("NOTEBOOK_VERSION:", NOTEBOOK_VERSION, "\n")
+cat("RUN_MAASLIN:", RUN_MAASLIN, "\n")
+cat("RUN_SPECIES_MAASLIN (Community shotgun only):", RUN_SPECIES_MAASLIN, "\n")
+cat("RUN_FB_RATIO:", RUN_FB_RATIO, "\n")
+cat("RUN_METABOLOMICS:", RUN_METABOLOMICS, "\n")
+cat("RANDOM_SEED:", RANDOM_SEED, "\n")
+cat("PDF_DEVICE:", if (capabilities("cairo")) "cairo_pdf" else "pdf", "\n")
+writeLines(NOTEBOOK_VERSION, file.path(LOG_DIR, "notebook_version.txt"))
+```
+
+# 1. Global configuration and helper functions
+
+```{r configuration}
+COHORT_LABELS <- c(
+  hamburg = "Community cohort",
+  american = "Student cohort",
+  Hamburg = "Community cohort",
+  American = "Student cohort"
+)
+
+pretty_cohort <- function(x) {
+  out <- unname(COHORT_LABELS[match(x, names(COHORT_LABELS))])
+  ifelse(is.na(out), x, out)
+}
+
+PREFERENCE_CANDIDATES <- c(
+  "donation", "risktaking", "timediscounting", "trust", "selfcontrol",
+  "religiousness", "conservative", "liberal", "social", "ecological",
+  "negative_reciprocity", "positive_reciprocity"
+)
+
+# Central labels and colour scales. Every exported figure uses these objects.
+COHORT_COLORS <- c(
+  "Community cohort" = "#F8766D",
+  "Student cohort" = "#00BFC4"
+)
+
+PREFERENCE_LABELS <- c(
+  "z_donation" = "Donation",
+  "z_risktaking" = "Risk-taking",
+  "z_timediscounting" = "Patience",
+  "z_trust" = "Trust",
+  "z_selfcontrol" = "Self-control",
+  "z_religiousness" = "Religiousness",
+  "z_conservative" = "Conservative orientation",
+  "z_liberal" = "Liberal orientation",
+  "z_social" = "Social orientation",
+  "z_ecological" = "Ecological orientation",
+  "z_negative_reciprocity" = "Negative reciprocity",
+  "z_positive_reciprocity" = "Positive reciprocity"
+)
+
+PREFERENCE_COLORS <- c(
+  "Donation" = "#D89000",
+  "Risk-taking" = "#E76F51",
+  "Patience" = "#0072B2",
+  "Trust" = "#6A5ACD",
+  "Self-control" = "#E83E8C",
+  "Religiousness" = "#8C564B",
+  "Conservative orientation" = "#F8766D",
+  "Liberal orientation" = "#00A676",
+  "Social orientation" = "#56B4E9",
+  "Ecological orientation" = "#7CAE00",
+  "Negative reciprocity" = "#00BFC4",
+  "Positive reciprocity" = "#B983FF"
+)
+
+COVARIATE_COLORS <- c(
+  "Age" = "#4D4D4D",
+  "Gender" = "#8C8C8C",
+  "BMI" = "#1F1F1F",
+  "Smoking" = "#8C6D31",
+  "Alcohol" = "#A6761D",
+  "Alcohol frequency" = "#A6761D",
+  "Club membership" = "#B3B3B3",
+  "Other covariate" = "#B3B3B3"
+)
+
+ASSOCIATION_COLORS <- c(PREFERENCE_COLORS, COVARIATE_COLORS)
+
+ECOLOGICAL_QUARTILE_COLORS <- c(
+  "Q1 lowest" = "#F8766D",
+  "Q2" = "#7CAE00",
+  "Q3" = "#00BFC4",
+  "Q4 highest" = "#C77CFF",
+  "Missing" = "#8C8C8C"
+)
+
+# The linked metadata use code 1 for female participants in both cohorts.
+# Keeping the codes explicit makes the cohort-description table auditable.
+FEMALE_CODE <- c(community = "1", student = "1")
+
+# Questionnaire items were administered on 0--10 scales, but the stored
+# behavioural variables are coded 1--11. This offset is used ONLY for
+# descriptive reporting (e.g. Table 1). Inferential models continue to use
+# within-cohort z-scores, for which subtracting a constant has no effect.
+# Donation is a 0--50 EUR amount and is never shifted.
+PREFERENCE_DESCRIPTIVE_OFFSET <- c(community = 1, student = 1)
+
+METABOLITE_COLORS <- c(
+  "3-IAA" = unname(PREFERENCE_COLORS["Self-control"]),
+  "Other metabolites" = "#8C8C8C"
+)
+
+FDR_THRESHOLD <- 0.10
+NOMINAL_THRESHOLD <- 0.05
+
+CORE_COVARIATES <- c("age", "gender", "bmi")
+
+LIFESTYLE_CANDIDATES_COMMUNITY <- c(
+  "smoking", "alcohol", "dietary_fibre_g", "saturated_fa_g",
+  "income", "clubmember", "marital_status"
+)
+
+LIFESTYLE_CANDIDATES_STUDENT <- c(
+  "smoking", "clubmember", "alcohol_frequency"
+)
+
+ALIASES <- list(
+  bmi = c("bmi", "body_mass_index", "bodymassindex"),
+  age = c("age", "age_years"),
+  gender = c("gender", "sex"),
+  marital_status = c("marital_status", "martial_status", "maritalstatus", "married"),
+  smoking = c("smoking", "smoke", "smoking_status", "smoking_frequency"),
+  alcohol = c("alcohol", "alcohol_consumption", "drinking"),
+  alcohol_frequency = c("alcohol_frequency", "alcohol_freq", "drinking_frequency"),
+  clubmember = c("clubmember", "club_member", "club_membership"),
+  donation = c("donation", "donate", "giving"),
+  risktaking = c("risktaking", "risk_taking", "risk"),
+  timediscounting = c("timediscounting", "time_discounting", "discounting", "temporal_discounting"),
+  selfcontrol = c("selfcontrol", "self_control"),
+  trust = c("trust"),
+  religiousness = c("religiousness", "religiosity"),
+  conservative = c("conservative"),
+  liberal = c("liberal"),
+  social = c("social"),
+  ecological = c("ecological"),
+  negative_reciprocity = c("negative_reciprocity"),
+  positive_reciprocity = c("positive_reciprocity")
+)
+
+TAXON_SYNONYMS <- c(
+  Firmicutes = "Bacillota",
+  Bacteroidetes = "Bacteroidota",
+  Actinobacteria = "Actinomycetota",
+  Proteobacteria = "Pseudomonadota"
+)
+
+cohort_config <- list(
+  community = list(
+    cohort = "Community cohort",
+    internal = "hamburg",
+    metadata_file = "23622_meta_dummy.r",
+    preference_file = "Hamburg_AltruismVariables.csv",
+    feature_tables = list(
+      family = "HHaf_motusv3.1_family.tsv",
+      genus = "HHaf_motusv3.1_genus.tsv",
+      species = "HHaf_motusv3.1.tsv"
+    ),
+    rarefied_tables = list(
+      family = "rtk_lowrc_HHaf_motusv3.1_family.tsvrarefied_to_8902.000000_n_0.tsv",
+      genus = "rtk_lowrc_HHaf_motusv3.1_genus.tsvrarefied_to_8902.000000_n_0.tsv",
+      phylum = "rtk_lowrc_HHaf_motusv3.1_phylum.tsvrarefied_to_8902.000000_n_0.tsv",
+      fine = "rtk_lowrc_HHaf_motusv3.1.tsvrarefied_to_8902.000000_n_0.tsv"
+    ),
+    # One alpha-diversity table per cohort is used for manuscript/QC plots.
+    # This avoids accidentally mixing RTK outputs from different taxonomic levels.
+    alpha_table = "rtk_lowrc_HHaf_motusv3.1.tsvmedian_alpha_diversity.tsv",
+    stage1 = CORE_COVARIATES,
+    stage2 = LIFESTYLE_CANDIDATES_COMMUNITY,
+    metabolomics = TRUE,
+    metabolome_file = "metabolome.r"
+  ),
+  student = list(
+    cohort = "Student cohort",
+    internal = "american",
+    metadata_file = "UHHdata.xlsx",
+    preference_file = NULL,
+    feature_tables = list(
+      family = "Family.txt",
+      genus = "Genus.txt"
+    ),
+    rarefied_tables = list(
+      family = "rtkFamilyamgrarefied_to_7572.000000_n_0.tsv",
+      genus = "rtkGenusamgrarefied_to_7572.000000_n_0.tsv",
+      phylum = "lowrc_Phylumrtkrarefied_to_7423.000000_n_0.tsv"
+    ),
+    # Student cohort alpha table. Do NOT use OTUrtkmedian_alpha_diversity.tsv here;
+    # that file has implausibly low richness values and is kept only for diagnostics.
+    alpha_table = "rtkmedian_alpha_diversity.tsv",
+    stage1 = CORE_COVARIATES,
+    stage2 = LIFESTYLE_CANDIDATES_STUDENT,
+    metabolomics = FALSE,
+    metabolome_file = NULL
+  )
+)
+```
+
+```{r helper-functions}
+alias_map <- setNames(rep(names(ALIASES), lengths(ALIASES)), unlist(ALIASES, use.names = FALSE))
+
+canon <- function(x) {
+  x <- stringr::str_trim(tolower(as.character(x)))
+  x <- stringr::str_replace_all(x, "[^a-z0-9]+", "_")
+  x <- stringr::str_replace_all(x, "_+", "_")
+  x <- stringr::str_replace_all(x, "^_|_$", "")
+  x <- ifelse(x %in% names(alias_map), alias_map[x], x)
+  make.unique(x, sep = "_")
+}
+
+read_any <- function(path, sheet = 1) {
+  if (is.null(path) || !file.exists(path)) return(NULL)
+  ext <- tolower(tools::file_ext(path))
+  if (ext %in% c("tsv", "txt")) {
+    return(as.data.frame(
+      readr::read_tsv(path, show_col_types = FALSE, progress = FALSE, name_repair = "minimal"),
+      check.names = FALSE
+    ))
+  }
+  if (ext == "csv") {
+    return(as.data.frame(
+      readr::read_csv(path, show_col_types = FALSE, progress = FALSE, name_repair = "minimal"),
+      check.names = FALSE
+    ))
+  }
+  if (ext %in% c("xlsx", "xls")) {
+    return(as.data.frame(
+      readxl::read_excel(path, sheet = sheet, .name_repair = "minimal"),
+      check.names = FALSE
+    ))
+  }
+  stop("Unsupported file type: ", path)
+}
+
+coerce_id <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x <- basename(x)
+  x <- stringr::str_replace_all(x, "\\.0+$", "")
+  x <- stringr::str_replace_all(x, "^X+", "")
+
+  # Prefer a terminal D-number if present.
+  d_id <- stringr::str_extract(x, "D\\d+$")
+
+  # Otherwise use the last numeric sample-like suffix.
+  # IMPORTANT: allow one-digit IDs. The previous {2,8} pattern left
+  # preference IDs 1, 3, 5, 7 and 9 as bare numbers instead of mapping
+  # them to D1, D3, D5, D7 and D9, producing five false non-matches.
+  n_id <- stringr::str_extract(x, "\\d{1,8}$")
+  n_id <- stringr::str_replace_all(n_id, "^0+", "")
+
+  out <- dplyr::case_when(
+    !is.na(d_id) ~ d_id,
+    !is.na(n_id) & n_id != "" ~ paste0("D", n_id),
+    TRUE ~ x
+  )
+
+  out
+}
+
+numify <- function(x) {
+  if (is.numeric(x) || is.integer(x)) return(as.numeric(x))
+  suppressWarnings(readr::parse_number(as.character(x)))
+}
+
+zscore <- function(x) {
+  x <- numify(x)
+  if (all(is.na(x))) return(x)
+  sx <- stats::sd(x, na.rm = TRUE)
+  if (!is.finite(sx) || sx == 0) return(rep(0, length(x)))
+  as.numeric(scale(x))
+}
+
+find_col <- function(df, candidates) {
+  n <- canon(names(df))
+  hit <- which(n %in% canon(candidates))
+  if (length(hit)) names(df)[hit[1]] else NULL
+}
+
+find_best_col <- function(df, candidates, pattern = NULL) {
+  # Prefer the candidate column with the most non-missing information.
+  # This is important for smoking in the Student cohort: depending on prior
+  # name harmonization, the informative column can be called smoking,
+  # smoking_frequency, smoke, smoking_status, or smoking_1.
+  cn <- names(df)
+  can <- canon(cn)
+  candidate_can <- canon(candidates)
+
+  idx <- which(can %in% candidate_can)
+
+  if (!is.null(pattern)) {
+    idx <- union(idx, grep(pattern, cn, ignore.case = TRUE))
+    idx <- union(idx, grep(pattern, can, ignore.case = TRUE))
+  }
+
+  idx <- idx[!is.na(idx) & idx >= 1 & idx <= length(cn)]
+  idx <- unique(idx)
+  # Never select audit/helper fields such as smoking_source_column as data.
+  idx <- idx[!grepl("source_column|source_file|_source$", cn[idx], ignore.case = TRUE)]
+  if (!length(idx)) return(NULL)
+
+  scores <- vapply(idx, function(i) {
+    vals <- clean_missing_strings(df[[i]])
+    sum(!is.na(vals))
+  }, integer(1))
+
+  cn[idx[which.max(scores)]]
+}
+
+standardize_taxon_label <- function(x) {
+  x <- as.character(x)
+  for (old in names(TAXON_SYNONYMS)) {
+    x <- stringr::str_replace_all(x, fixed(old), TAXON_SYNONYMS[[old]])
+  }
+  x
+}
+
+save_table <- function(df, filename) {
+  path <- file.path(TABLES_DIR, filename)
+  readr::write_csv(df, path, na = "")
+  message("Wrote table: ", path)
+  invisible(path)
+}
+
+safe_figure_dimension <- function(x, fallback, lower = 2, upper = 20) {
+  x <- suppressWarnings(as.numeric(x)[1])
+  if (!is.finite(x) || x <= 0) x <- fallback
+  min(max(x, lower), upper)
+}
+
+save_figure <- function(p, filename, width = 7, height = 5, out_dir = FIGURES_DIR) {
+  if (is.null(p)) return(invisible(NULL))
+  width <- safe_figure_dimension(width, fallback = 7)
+  height <- safe_figure_dimension(height, fallback = 5)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  pdf <- file.path(out_dir, paste0(filename, ".pdf"))
+  svg <- file.path(out_dir, paste0(filename, ".svg"))
+
+  tryCatch(
+    ggplot2::ggsave(pdf, p, width = width, height = height, device = PDF_DEVICE, limitsize = FALSE),
+    error = function(e) {
+      diagnostic_rds <- file.path(LOG_DIR, paste0(filename, "_failed_plot.rds"))
+      diagnostic_txt <- file.path(LOG_DIR, paste0(filename, "_figure_error.txt"))
+      saveRDS(p, diagnostic_rds)
+      writeLines(
+        c(
+          paste0("Figure: ", filename),
+          paste0("Width: ", width),
+          paste0("Height: ", height),
+          paste0("Error: ", conditionMessage(e))
+        ),
+        diagnostic_txt
+      )
+      stop("Failed to write PDF figure '", filename, "': ", conditionMessage(e), call. = FALSE)
+    }
+  )
+
+  # SVG is useful for editing but should not invalidate a successful PDF run.
+  tryCatch(
+    ggplot2::ggsave(svg, p, width = width, height = height, limitsize = FALSE),
+    error = function(e) warning("PDF written, but SVG export failed for ", filename, ": ", conditionMessage(e), call. = FALSE)
+  )
+
+  message("Wrote figure: ", pdf)
+  invisible(list(pdf = pdf, svg = if (file.exists(svg)) svg else NA_character_))
+}
+
+fig_theme <- function(base_size = 9, legend_position = "bottom") {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title = element_blank(),
+      plot.subtitle = element_blank(),
+      legend.position = legend_position,
+      legend.title = element_text(face = "bold"),
+      strip.background = element_rect(fill = "grey95", colour = "grey80"),
+      strip.text = element_text(face = "bold"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(size = base_size),
+      axis.text = element_text(size = base_size - 1),
+      plot.margin = margin(5.5, 14, 5.5, 5.5)
+    )
+}
+```
+
+# 2. Data inventory
+
+This section checks that all expected input files are present and records their basic structure. It is the first chunk to run when debugging paths, file formats, or sample-ID mismatches.
+
+```{r expected-files}
+input_files <- unique(c(
+  cohort_config$community$metadata_file,
+  cohort_config$community$preference_file,
+  cohort_config$community$feature_tables$family,
+  cohort_config$community$feature_tables$genus,
+  cohort_config$student$metadata_file,
+  cohort_config$student$feature_tables$family,
+  cohort_config$student$feature_tables$genus,
+  cohort_config$community$alpha_table,
+  cohort_config$student$alpha_table,
+  if (RUN_SPECIES_MAASLIN) cohort_config$community$feature_tables$species else NULL,
+  if (RUN_FB_RATIO) c(
+    cohort_config$community$rarefied_tables$phylum,
+    cohort_config$student$rarefied_tables$phylum
+  ) else NULL,
+  if (RUN_METABOLOMICS) cohort_config$community$metabolome_file else NULL
+))
+```
+
+```{r inspect-input-functions}
+inspect_file <- function(file) {
+  path <- file.path(DATA_DIR, file)
+  exists <- file.exists(path)
+  size_mb <- if (exists) unname(file.info(path)$size / 1024^2) else NA_real_
+
+  make_row <- function(object = NA_character_, class = NA_character_,
+                       n_rows = NA_integer_, n_cols = NA_integer_,
+                       first_columns = NA_character_, first_rownames = NA_character_,
+                       first_colnames = NA_character_, note = NA_character_) {
+    tibble(
+      file = file,
+      exists = exists,
+      size_mb = size_mb,
+      object = object,
+      class = class,
+      n_rows = n_rows,
+      n_cols = n_cols,
+      first_columns = first_columns,
+      first_rownames = first_rownames,
+      first_colnames = first_colnames,
+      note = note
+    )
+  }
+
+  if (!exists) return(make_row(note = "File not found"))
+
+  rdata_inputs <- unique(stats::na.omit(c(
+    cohort_config$community$metadata_file,
+    cohort_config$community$metabolome_file
+  )))
+  if (file %in% rdata_inputs) {
+    e <- new.env(parent = emptyenv())
+    load(path, envir = e)
+    return(purrr::map_dfr(ls(e), function(obj) {
+      x <- get(obj, envir = e)
+      d <- dim(x)
+      make_row(
+        object = obj,
+        class = paste(class(x), collapse = "; "),
+        n_rows = if (!is.null(d)) as.integer(d[1]) else NA_integer_,
+        n_cols = if (!is.null(d)) as.integer(d[2]) else NA_integer_,
+        first_columns = if (!is.null(colnames(x))) paste(head(colnames(x), 8), collapse = " | ") else NA_character_,
+        first_rownames = if (!is.null(rownames(x))) paste(head(rownames(x), 8), collapse = " | ") else NA_character_,
+        first_colnames = if (!is.null(colnames(x))) paste(head(colnames(x), 8), collapse = " | ") else NA_character_
+      )
+    }))
+  }
+
+  if (grepl("\\.xlsx$|\\.xls$", file, ignore.case = TRUE)) {
+    return(purrr::map_dfr(readxl::excel_sheets(path), function(sh) {
+      x <- readxl::read_excel(path, sheet = sh, .name_repair = "minimal")
+      make_row(
+        object = paste0("sheet:", sh),
+        class = paste(class(x), collapse = "; "),
+        n_rows = nrow(x),
+        n_cols = ncol(x),
+        first_columns = paste(head(names(x), 8), collapse = " | "),
+        first_rownames = NA_character_,
+        first_colnames = paste(head(names(x), 8), collapse = " | ")
+      )
+    }))
+  }
+
+  # The functional annotation table is several gigabytes. Reading it in full
+  # solely for the inventory wastes memory; analysis chunks can still load it
+  # explicitly if it is ever used.
+  if (is.finite(size_mb) && size_mb > 500) {
+    x <- tryCatch(
+      data.table::fread(path, nrows = 2, data.table = FALSE, check.names = FALSE, showProgress = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(x)) return(make_row(object = "unreadable", note = "Large-file header read failed"))
+    return(make_row(
+      object = "large table (header only)",
+      class = paste(class(x), collapse = "; "),
+      n_rows = NA_integer_,
+      n_cols = ncol(x),
+      first_columns = paste(head(names(x), 8), collapse = " | "),
+      first_rownames = NA_character_,
+      first_colnames = paste(head(names(x), 8), collapse = " | "),
+      note = "Row count intentionally not evaluated in inventory"
+    ))
+  }
+
+  x <- tryCatch(
+    data.table::fread(path, data.table = FALSE, check.names = FALSE, showProgress = FALSE),
+    error = function(e) NULL
+  )
+  if (is.null(x)) return(make_row(object = "unreadable", note = "fread failed"))
+
+  make_row(
+    object = "table",
+    class = paste(class(x), collapse = "; "),
+    n_rows = nrow(x),
+    n_cols = ncol(x),
+    first_columns = paste(head(names(x), 8), collapse = " | "),
+    first_rownames = NA_character_,
+    first_colnames = paste(head(names(x), 8), collapse = " | ")
+  )
+}
+```
+
+```{r input-inventory}
+input_inventory <- purrr::map_dfr(input_files, inspect_file)
+knitr::kable(input_inventory)
+save_table(input_inventory, "input_inventory.csv")
+```
+
+# 3. Metadata loading and harmonization
+
+```{r metadata-functions}
+load_community_meta <- function() {
+  meta_file <- file.path(DATA_DIR, cohort_config$community$metadata_file)
+  pref_file <- file.path(DATA_DIR, cohort_config$community$preference_file)
+
+  e <- new.env(parent = emptyenv())
+  load(meta_file, envir = e)
+  if (!exists("meta_dummy", envir = e, inherits = FALSE)) {
+    stop("Expected object 'meta_dummy' in ", meta_file)
+  }
+
+  meta <- as.data.frame(get("meta_dummy", envir = e), check.names = FALSE)
+  names(meta) <- canon(names(meta))
+  meta$sample_id <- coerce_id(rownames(meta))
+
+  prefs <- read_any(pref_file)
+  names(prefs) <- canon(names(prefs))
+  id_col <- find_col(prefs, c("novoge_sample_id", "sample_id", "sampleid"))
+  if (is.null(id_col)) stop("Could not find sample ID column in Hamburg preference file.")
+  prefs$sample_id <- coerce_id(prefs[[id_col]])
+
+  meta <- dplyr::left_join(meta, prefs, by = "sample_id", suffix = c("", "_pref"))
+  meta <- meta %>%
+    dplyr::filter(!is.na(sample_id), sample_id != "") %>%
+    dplyr::distinct(sample_id, .keep_all = TRUE)
+  rownames(meta) <- meta$sample_id
+  meta
+}
+
+load_student_meta <- function() {
+  meta_file <- file.path(DATA_DIR, cohort_config$student$metadata_file)
+  meta <- tryCatch(read_any(meta_file, sheet = "UHHdata"), error = function(e) read_any(meta_file, sheet = 1))
+  names(meta) <- canon(names(meta))
+  id_col <- find_col(meta, c("kitid", "sample_id", "sampleid"))
+  if (is.null(id_col)) stop("Could not find kitid/sample_id in student metadata.")
+  meta$sample_id <- coerce_id(meta[[id_col]])
+  meta <- meta %>%
+    dplyr::filter(!is.na(sample_id), sample_id != "") %>%
+    dplyr::distinct(sample_id, .keep_all = TRUE)
+  rownames(meta) <- meta$sample_id
+  meta
+}
+
+harmonize_bmi <- function(meta) {
+  bmi_col <- find_col(meta, c("bmi", "body_mass_index", "bodymassindex"))
+  weight_col <- find_col(meta, c("weight_kg", "weight", "body_weight", "bodyweight"))
+  height_col <- find_col(meta, c("height_cm", "height", "body_height", "bodyheight"))
+
+  raw_bmi <- if (!is.null(bmi_col)) numify(meta[[bmi_col]]) else rep(NA_real_, nrow(meta))
+  calc_bmi <- rep(NA_real_, nrow(meta))
+
+  if (!is.null(weight_col) && !is.null(height_col)) {
+    w <- numify(meta[[weight_col]])
+    h <- numify(meta[[height_col]])
+    calc_bmi <- w / (h / 100)^2
+    calc_bmi[!is.finite(calc_bmi)] <- NA_real_
+  }
+
+  bmi <- raw_bmi
+  bad <- is.na(bmi) | bmi < 10 | bmi > 60
+  bmi[bad & !is.na(calc_bmi)] <- calc_bmi[bad & !is.na(calc_bmi)]
+
+  meta$bmi_raw <- raw_bmi
+  meta$bmi <- bmi
+  meta
+}
+
+clean_missing_strings <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_trim(x)
+  x[tolower(x) %in% c("", "na", "n/a", "nan", "null", "missing", "not applicable", "not_applicable", "not sure", "unknown")] <- NA_character_
+  x
+}
+
+make_smoking_factor <- function(x) {
+  smoke_chr <- clean_missing_strings(x)
+  observed <- unique(stats::na.omit(smoke_chr))
+  preferred_order <- c(
+    "Never", "Rarely (less than once/week)", "Rarely (a few times/month)",
+    "Occasionally (1-2 times/week)", "Regularly (3-5 times/week)", "Daily"
+  )
+  if ("Never" %in% observed) {
+    lev <- c(preferred_order[preferred_order %in% observed], sort(setdiff(observed, preferred_order)))
+    factor(smoke_chr, levels = lev)
+  } else {
+    factor(smoke_chr)
+  }
+}
+
+make_alcohol_frequency_factor <- function(x) {
+  alcohol_chr <- clean_missing_strings(x)
+  observed <- unique(stats::na.omit(alcohol_chr))
+  preferred_order <- c(
+    "Never", "Rarely (a few times/month)", "Occasionally (1-2 times/week)",
+    "Regularly (3-5 times/week)", "Daily"
+  )
+  if ("Never" %in% observed) {
+    lev <- c(preferred_order[preferred_order %in% observed], sort(setdiff(observed, preferred_order)))
+    factor(alcohol_chr, levels = lev)
+  } else {
+    factor(alcohol_chr)
+  }
+}
+
+make_clubmember_factor <- function(x) {
+  factor(clean_missing_strings(x))
+}
+
+add_preference_zscores <- function(meta, preference_candidates = PREFERENCE_CANDIDATES) {
+  present <- preference_candidates[preference_candidates %in% canon(names(meta))]
+  for (p in present) {
+    src <- names(meta)[match(p, canon(names(meta)))]
+    meta[[paste0("z_", p)]] <- zscore(meta[[src]])
+  }
+  meta
+}
+
+harmonize_model_covariates <- function(meta) {
+  # Keep covariate names and classes explicit and reproducible.
+  # Especially important: the Student cohort workbook may contain smoking_frequency;
+  # ALIASES maps this to smoking, and here smoking is forced to be a factor.
+
+  if ("age" %in% names(meta)) meta$age <- numify(meta$age)
+  if ("bmi" %in% names(meta)) meta$bmi <- numify(meta$bmi)
+
+  if ("gender" %in% names(meta)) {
+    gender_chr <- clean_missing_strings(meta$gender)
+    meta$gender <- factor(gender_chr)
+  }
+
+  smoke_col <- find_best_col(
+    meta,
+    c("smoking", "smoking_frequency", "smoke", "smoking_status", "tobacco", "cigarette"),
+    pattern = "smok|tobacco|cigarette"
+  )
+  if (!is.null(smoke_col)) {
+    meta$smoking_source_column <- smoke_col
+    meta$smoking <- make_smoking_factor(meta[[smoke_col]])
+  } else {
+    meta$smoking_source_column <- NA_character_
+    meta$smoking <- factor(rep(NA_character_, nrow(meta)))
+  }
+
+  if ("clubmember" %in% names(meta)) {
+    meta$clubmember <- make_clubmember_factor(meta$clubmember)
+  }
+
+  if ("alcohol_frequency" %in% names(meta)) {
+    meta$alcohol_frequency <- make_alcohol_frequency_factor(meta$alcohol_frequency)
+  }
+
+  meta
+}
+
+add_ecological_quartiles <- function(meta) {
+  labels_q <- c("Q1 lowest", "Q2", "Q3", "Q4 highest")
+
+  if (!"z_ecological" %in% names(meta)) {
+    meta$ecological_preference_q <- factor("Missing", levels = c(labels_q, "Missing"))
+    return(meta)
+  }
+
+  z <- meta$z_ecological
+  q <- rep(NA_integer_, length(z))
+  ok <- is.finite(z)
+  if (sum(ok) >= 4) q[ok] <- dplyr::ntile(z[ok], 4)
+
+  lab <- rep("Missing", length(z))
+  lab[!is.na(q)] <- labels_q[q[!is.na(q)]]
+  meta$ecological_preference_q <- factor(lab, levels = c(labels_q, "Missing"))
+  meta
+}
+
+prepare_metadata_for_models <- function(meta) {
+  meta %>%
+    harmonize_bmi() %>%
+    harmonize_model_covariates() %>%
+    add_preference_zscores() %>%
+    add_ecological_quartiles()
+}
+```
+
+```{r load-metadata}
+meta_community <- load_community_meta() %>% prepare_metadata_for_models()
+meta_student <- load_student_meta() %>% prepare_metadata_for_models()
+
+metadata_summary <- tibble(
+  cohort = c("Community cohort", "Student cohort"),
+  n = c(nrow(meta_community), nrow(meta_student)),
+  n_preferences = c(
+    sum(startsWith(names(meta_community), "z_")),
+    sum(startsWith(names(meta_student), "z_"))
+  ),
+  n_bmi_missing = c(sum(is.na(meta_community$bmi)), sum(is.na(meta_student$bmi))),
+  n_smoking_missing = c(sum(is.na(meta_community$smoking)), sum(is.na(meta_student$smoking))),
+  smoking_levels = c(
+    paste(levels(droplevels(meta_community$smoking)), collapse = " | "),
+    paste(levels(droplevels(meta_student$smoking)), collapse = " | ")
+  )
+)
+
+knitr::kable(metadata_summary)
+save_table(metadata_summary, "metadata_summary.csv")
+
+saveRDS(meta_community, file.path(RESULTS_DIR, "metadata_community.rds"))
+saveRDS(meta_student, file.path(RESULTS_DIR, "metadata_student.rds"))
+readr::write_csv(meta_community, file.path(TABLES_DIR, "metadata_community.csv"))
+readr::write_csv(meta_student, file.path(TABLES_DIR, "metadata_student.csv"))
+```
+
+## 3.0a Community preference-linkage audit
+
+This audit documents the linkage between the 138 Community microbiome records and
+`Hamburg_AltruismVariables.csv`. It is intentionally run from the two source files
+rather than from the already joined object so that ID-normalization problems are
+visible. With the corrected one-digit ID handling, all 138 IDs should overlap.
+
+```{r community-preference-linkage-audit}
+community_meta_source_env <- new.env(parent = emptyenv())
+load(
+  file.path(DATA_DIR, cohort_config$community$metadata_file),
+  envir = community_meta_source_env
+)
+
+community_meta_source <- as.data.frame(
+  get("meta_dummy", envir = community_meta_source_env),
+  check.names = FALSE
+)
+names(community_meta_source) <- canon(names(community_meta_source))
+community_meta_source$sample_id <- coerce_id(rownames(community_meta_source))
+
+community_pref_source <- read_any(
+  file.path(DATA_DIR, cohort_config$community$preference_file)
+)
+names(community_pref_source) <- canon(names(community_pref_source))
+community_pref_id_col <- find_col(
+  community_pref_source,
+  c("novoge_sample_id", "sample_id", "sampleid")
+)
+if (is.null(community_pref_id_col)) {
+  stop("Could not identify the Community preference sample-ID column.")
+}
+community_pref_source$sample_id <- coerce_id(
+  community_pref_source[[community_pref_id_col]]
+)
+
+community_preference_linkage_audit <- tibble(
+  dataset = c(
+    "meta_dummy",
+    "Hamburg_AltruismVariables.csv",
+    "harmonized meta_community",
+    "IDs shared by meta_dummy and preference file"
+  ),
+  n = c(
+    dplyr::n_distinct(community_meta_source$sample_id),
+    dplyr::n_distinct(community_pref_source$sample_id),
+    dplyr::n_distinct(rownames(meta_community)),
+    length(intersect(
+      community_meta_source$sample_id,
+      community_pref_source$sample_id
+    ))
+  )
+)
+
+community_preference_unmatched_ids <- dplyr::bind_rows(
+  tibble(
+    issue = "preference_id_not_in_meta_dummy",
+    sample_id = setdiff(
+      community_pref_source$sample_id,
+      community_meta_source$sample_id
+    )
+  ),
+  tibble(
+    issue = "meta_dummy_id_without_preference_record",
+    sample_id = setdiff(
+      community_meta_source$sample_id,
+      community_pref_source$sample_id
+    )
+  )
+)
+
+knitr::kable(community_preference_linkage_audit)
+knitr::kable(community_preference_unmatched_ids)
+save_table(
+  community_preference_linkage_audit,
+  "community_preference_linkage_audit.csv"
+)
+save_table(
+  community_preference_unmatched_ids,
+  "community_preference_unmatched_ids.csv"
+)
+```
+
+# 3.1 Cohort-description table
+
+This section generates the descriptive cohort characteristics used for manuscript
+Table 1 directly from the harmonized analysis metadata. Preference medians are
+reported on the original questionnaire scale (0--10). The source variables are
+stored as 1--11, so an offset of 1 is removed for descriptive reporting only.
+Donation remains on its original 0--50 EUR scale. The inferential models are not
+changed by this reporting transformation because preference predictors are
+z-standardized within cohort.
+
+```{r cohort-description}
+female_indicator <- function(x, female_code = "1") {
+  x_chr <- clean_missing_strings(x)
+  out <- ifelse(is.na(x_chr), NA_real_, as.numeric(x_chr == female_code))
+  as.numeric(out)
+}
+
+get_numeric_column <- function(meta, candidates) {
+  col <- find_col(meta, candidates)
+  if (is.null(col)) return(rep(NA_real_, nrow(meta)))
+  numify(meta[[col]])
+}
+
+get_preference_raw <- function(meta, var) {
+  col <- find_col(meta, c(var))
+  if (is.null(col)) return(rep(NA_real_, nrow(meta)))
+  numify(meta[[col]])
+}
+
+preference_for_description <- function(meta, var, cohort_key) {
+  x <- get_preference_raw(meta, var)
+  offset <- unname(PREFERENCE_DESCRIPTIVE_OFFSET[[cohort_key]])
+  if (!is.finite(offset)) offset <- 0
+  x - offset
+}
+
+make_cohort_description_long <- function(meta, cohort_key, cohort_label, female_code) {
+  age <- get_numeric_column(meta, c("age", "age_years"))
+  bmi <- get_numeric_column(meta, c("bmi", "body_mass_index", "bodymassindex"))
+  weight <- get_numeric_column(meta, c("weight_kg", "weight", "body_weight", "bodyweight"))
+  female <- if ("gender" %in% names(meta)) {
+    female_indicator(meta$gender, female_code)
+  } else {
+    rep(NA_real_, nrow(meta))
+  }
+
+  donation <- get_preference_raw(meta, "donation")
+  risk <- preference_for_description(meta, "risktaking", cohort_key)
+  patience <- preference_for_description(meta, "timediscounting", cohort_key)
+  trust <- preference_for_description(meta, "trust", cohort_key)
+  selfcontrol <- preference_for_description(meta, "selfcontrol", cohort_key)
+  ecological <- preference_for_description(meta, "ecological", cohort_key)
+
+  tibble(
+    cohort = cohort_label,
+    sample_id = rownames(meta),
+    age = age,
+    female = female,
+    bmi = bmi,
+    weight = weight,
+    donation = donation,
+    risk_taking = risk,
+    patience = patience,
+    trust = trust,
+    self_control = selfcontrol,
+    ecological_orientation = ecological
+  )
+}
+
+cohort_description_data <- dplyr::bind_rows(
+  make_cohort_description_long(
+    meta_community,
+    "community",
+    "Community cohort",
+    FEMALE_CODE[["community"]]
+  ),
+  make_cohort_description_long(
+    meta_student,
+    "student",
+    "Student cohort",
+    FEMALE_CODE[["student"]]
+  )
+)
+
+cohort_description <- cohort_description_data %>%
+  dplyr::group_by(cohort) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    age_mean = mean(age, na.rm = TRUE),
+    age_sd = stats::sd(age, na.rm = TRUE),
+    age_n = sum(is.finite(age)),
+    female_percent = 100 * mean(female, na.rm = TRUE),
+    gender_n = sum(!is.na(female)),
+    bmi_mean = mean(bmi, na.rm = TRUE),
+    bmi_sd = stats::sd(bmi, na.rm = TRUE),
+    bmi_n = sum(is.finite(bmi)),
+    weight_mean = mean(weight, na.rm = TRUE),
+    weight_sd = stats::sd(weight, na.rm = TRUE),
+    weight_n = sum(is.finite(weight)),
+    donation_mean = mean(donation, na.rm = TRUE),
+    donation_sd = stats::sd(donation, na.rm = TRUE),
+    donation_n = sum(is.finite(donation)),
+    donors_percent = 100 * mean(donation > 0, na.rm = TRUE),
+    risk_taking_median = median(risk_taking, na.rm = TRUE),
+    patience_median = median(patience, na.rm = TRUE),
+    trust_median = median(trust, na.rm = TRUE),
+    self_control_median = median(self_control, na.rm = TRUE),
+    ecological_orientation_median = median(ecological_orientation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Auditable long-form summaries with n/min/median/max for each preference.
+cohort_preference_descriptive_audit <- cohort_description_data %>%
+  dplyr::select(
+    cohort, sample_id, donation, risk_taking, patience, trust,
+    self_control, ecological_orientation
+  ) %>%
+  tidyr::pivot_longer(
+    -c(cohort, sample_id),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  dplyr::group_by(cohort, variable) %>%
+  dplyr::summarise(
+    n = sum(is.finite(value)),
+    min = if (any(is.finite(value))) min(value, na.rm = TRUE) else NA_real_,
+    mean = if (any(is.finite(value))) mean(value, na.rm = TRUE) else NA_real_,
+    sd = if (sum(is.finite(value)) > 1) stats::sd(value, na.rm = TRUE) else NA_real_,
+    median = if (any(is.finite(value))) median(value, na.rm = TRUE) else NA_real_,
+    max = if (any(is.finite(value))) max(value, na.rm = TRUE) else NA_real_,
+    .groups = "drop"
+  )
+
+# Manuscript-ready table values in the same order as Table 1.
+cohort_description_manuscript <- cohort_description %>%
+  dplyr::transmute(
+    cohort,
+    `Sample size` = n,
+    `Age, mean (SD), years` = sprintf("%.1f (%.1f)", age_mean, age_sd),
+    `Female participants, %` = sprintf("%.1f", female_percent),
+    `BMI, mean (SD), kg/m2` = sprintf("%.1f (%.1f)", bmi_mean, bmi_sd),
+    `Weight, mean (SD), kg` = ifelse(
+      is.finite(weight_mean),
+      sprintf("%.1f (%.1f)", weight_mean, weight_sd),
+      NA_character_
+    ),
+    `Donation (in Euro), mean (SD)` = sprintf(
+      "%.1f (%.1f)", donation_mean, donation_sd
+    ),
+    `Donors, %` = sprintf("%.1f", donors_percent),
+    `Risk-taking, median` = sprintf("%g", risk_taking_median),
+    `Patience/time discounting, median` = sprintf("%g", patience_median),
+    `Trust, median` = sprintf("%g", trust_median),
+    `Self-control, median` = sprintf("%g", self_control_median),
+    `Ecological orientation, median` = sprintf("%g", ecological_orientation_median)
+  )
+
+knitr::kable(cohort_description, digits = 2)
+knitr::kable(cohort_description_manuscript)
+knitr::kable(cohort_preference_descriptive_audit, digits = 2)
+
+save_table(cohort_description, "cohort_description.csv")
+save_table(
+  cohort_description_manuscript,
+  "cohort_description_manuscript_table1.csv"
+)
+save_table(
+  cohort_preference_descriptive_audit,
+  "cohort_preference_descriptive_audit.csv"
+)
+```
+
+# 4. Feature-table loading and sample overlap
+
+```{r feature-table-functions}
+read_feature_table <- function(path) {
+  df <- read_any(path)
+  if (is.null(df) || ncol(df) < 2) return(NULL)
+  names(df) <- make.unique(names(df))
+  tax <- standardize_taxon_label(df[[1]])
+  mat <- as.matrix(df[, -1, drop = FALSE])
+  suppressWarnings(storage.mode(mat) <- "numeric")
+  mat[is.na(mat)] <- 0
+  rownames(mat) <- make.unique(as.character(tax))
+  colnames(mat) <- coerce_id(names(df)[-1])
+  mat
+}
+
+align_feature_to_meta <- function(feature_mat, meta) {
+  feature_ids <- coerce_id(colnames(feature_mat))
+  meta_ids <- rownames(meta)
+  common <- intersect(feature_ids, meta_ids)
+  if (!length(common)) {
+    stop("No sample overlap between feature table and metadata.")
+  }
+  list(
+    feature = feature_mat[, match(common, feature_ids), drop = FALSE],
+    meta = meta[match(common, meta_ids), , drop = FALSE],
+    common = common
+  )
+}
+
+# Convert a metadata/data-frame object with sample IDs stored in row names
+# into an explicit sample_id column, without duplicating an existing sample_id column.
+# This avoids: Error in tibble::rownames_to_column(): Column name `sample_id` must not be duplicated.
+meta_with_sample_id <- function(meta, id_col = "sample_id") {
+  out <- as.data.frame(meta, check.names = FALSE)
+  out[[id_col]] <- NULL
+  tibble::rownames_to_column(out, var = id_col)
+}
+```
+
+```{r load-feature-tables}
+feature_paths <- list(
+  community_family = file.path(DATA_DIR, cohort_config$community$feature_tables$family),
+  community_genus = file.path(DATA_DIR, cohort_config$community$feature_tables$genus),
+  community_species = file.path(DATA_DIR, cohort_config$community$feature_tables$species),
+  community_phylum = file.path(DATA_DIR, cohort_config$community$rarefied_tables$phylum),
+  student_family = file.path(DATA_DIR, cohort_config$student$feature_tables$family),
+  student_genus = file.path(DATA_DIR, cohort_config$student$feature_tables$genus),
+  student_phylum = file.path(DATA_DIR, cohort_config$student$rarefied_tables$phylum)
+)
+
+features <- purrr::map(feature_paths, read_feature_table)
+required_feature_names <- c(
+  "community_family", "community_genus",
+  "student_family", "student_genus"
+)
+if (RUN_FB_RATIO) {
+  required_feature_names <- c(required_feature_names, "community_phylum", "student_phylum")
+}
+missing_required_features <- required_feature_names[
+  purrr::map_lgl(features[required_feature_names], is.null)
+]
+if (length(missing_required_features)) {
+  stop(
+    "Required feature table(s) could not be loaded: ",
+    paste(missing_required_features, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+sample_overlap <- tibble(
+  table = names(features),
+
+  n_taxa = purrr::map_int(features, function(ft) {
+    if (is.null(ft)) return(NA_integer_)
+    nrow(ft)
+  }),
+
+  n_samples_raw = purrr::map_int(features, function(ft) {
+    if (is.null(ft)) return(NA_integer_)
+    ncol(ft)
+  }),
+
+  n_overlap = purrr::imap_int(features, function(ft, nm) {
+
+    if (is.null(ft))
+      return(NA_integer_)
+
+    meta <- if (startsWith(nm, "community"))
+      meta_community
+    else
+      meta_student
+
+    length(intersect(
+      coerce_id(colnames(ft)),
+      rownames(meta)
+    ))
+  })
+)
+
+knitr::kable(sample_overlap)
+save_table(sample_overlap, "sample_overlap_feature_tables.csv")
+
+```
+
+# 5. Alpha diversity: one table per cohort
+
+For the manuscript and QC report, alpha diversity is read from exactly **one RTK median alpha-diversity table per cohort**:
+
+- Community cohort: `r cohort_config$community$alpha_table`
+- Student cohort: `r cohort_config$student$alpha_table`
+
+This avoids accidentally mixing alpha-diversity estimates derived from different taxonomic resolutions.
+
+```{r alpha-selected-files}
+alpha_files_selected <- tibble(
+  cohort = c("Community cohort", "Student cohort"),
+  file = c(cohort_config$community$alpha_table, cohort_config$student$alpha_table),
+  path = file.path(DATA_DIR, file),
+  exists = file.exists(path)
+)
+
+knitr::kable(alpha_files_selected)
+save_table(alpha_files_selected, "alpha_selected_files.csv")
+
+if (any(!alpha_files_selected$exists)) {
+  stop(
+    "Missing selected alpha-diversity file(s): ",
+    paste(alpha_files_selected$file[!alpha_files_selected$exists], collapse = ", ")
+  )
+}
+```
+
+```{r alpha-functions-fixed}
+read_rtk_median_alpha <- function(path, cohort_label, meta = NULL, level_label = "RTK median alpha") {
+  if (is.null(path) || !file.exists(path)) {
+    message("Alpha file not found: ", path)
+    return(tibble())
+  }
+
+  # RTK median-alpha files can appear in two slightly different forms:
+  # 1) depth row + metric-header row + samples
+  #      depth  7423 7423 ...
+  #      Smpl   Richness Shannon ...
+  #      X103... 233 3.20 ...
+  # 2) metric-header row + samples
+  #      Smpl   Richness Shannon ...
+  #      D105   359 4.34 ...
+  # Read without column names and then reconstruct the correct header.
+  raw <- readr::read_tsv(
+    path,
+    col_names = FALSE,
+    show_col_types = FALSE,
+    progress = FALSE,
+    name_repair = "minimal"
+  )
+
+  raw <- as.data.frame(raw, check.names = FALSE)
+  raw <- raw[rowSums(!is.na(raw)) > 0, , drop = FALSE]
+
+  if (nrow(raw) < 2 || ncol(raw) < 3) {
+    message("Alpha file too small or malformed: ", path)
+    return(tibble())
+  }
+
+  first_col <- canon(raw[[1]])
+
+  if (first_col[1] == "depth" && nrow(raw) >= 2 && first_col[2] %in% c("smpl", "sample", "sample_id", "sampleid")) {
+    header <- as.character(unlist(raw[2, ], use.names = FALSE))
+    dat <- raw[-c(1, 2), , drop = FALSE]
+  } else if (first_col[1] %in% c("smpl", "sample", "sample_id", "sampleid")) {
+    header <- as.character(unlist(raw[1, ], use.names = FALSE))
+    dat <- raw[-1, , drop = FALSE]
+  } else {
+    # fallback: try normal read with header if the file already had a conventional header
+    normal <- read_any(path)
+    if (is.null(normal)) return(tibble())
+    dat <- normal
+    header <- names(dat)
+  }
+
+  header <- janitor::make_clean_names(header)
+  names(dat) <- make.unique(header)
+  names(dat) <- canon(names(dat))
+
+  id_col <- intersect(c("smpl", "sample", "sample_id", "sampleid", "id"), names(dat))[1]
+  richness_col <- intersect(c("richness", "observed", "observed_richness", "smpl_richness"), names(dat))[1]
+  shannon_col <- intersect(c("shannon", "shannon_diversity"), names(dat))[1]
+  simpson_col <- intersect(c("simpson"), names(dat))[1]
+  invsimpson_col <- intersect(c("inv_simpson", "inverse_simpson", "inv_simpson_1"), names(dat))[1]
+  chao1_col <- intersect(c("chao1", "chao"), names(dat))[1]
+  evenness_col <- intersect(c("eveness", "evenness", "pielou", "pielou_evenness"), names(dat))[1]
+
+  if (is.na(id_col) || is.na(richness_col) || is.na(shannon_col)) {
+    message("Could not identify required alpha columns in: ", path)
+    message("Columns are: ", paste(names(dat), collapse = ", "))
+    return(tibble())
+  }
+
+  out <- tibble(
+    sample_id_original = as.character(dat[[id_col]]),
+    sample_id = coerce_id(dat[[id_col]]),
+    cohort = cohort_label,
+    level = level_label,
+    richness = numify(dat[[richness_col]]),
+    shannon = numify(dat[[shannon_col]]),
+    simpson = if (!is.na(simpson_col)) numify(dat[[simpson_col]]) else NA_real_,
+    inv_simpson = if (!is.na(invsimpson_col)) numify(dat[[invsimpson_col]]) else NA_real_,
+    chao1 = if (!is.na(chao1_col)) numify(dat[[chao1_col]]) else NA_real_,
+    evenness = if (!is.na(evenness_col)) numify(dat[[evenness_col]]) else NA_real_,
+    source_file = basename(path)
+  ) %>%
+    dplyr::filter(is.finite(richness), is.finite(shannon))
+
+  if (!is.null(meta)) {
+    before <- nrow(out)
+    out <- out %>% dplyr::filter(sample_id %in% rownames(meta))
+    message(
+      cohort_label, " alpha: ", nrow(out), "/", before,
+      " rows overlapped with metadata from ", basename(path)
+    )
+  }
+
+  out
+}
+
+plot_alpha_cohort <- function(alpha_df, filename, width = 6.4, height = 3.8) {
+  if (!nrow(alpha_df)) stop("No alpha-diversity rows available for plotting.")
+
+  alpha_long <- alpha_df %>%
+    tidyr::pivot_longer(c(shannon, richness), names_to = "metric", values_to = "value") %>%
+    dplyr::mutate(
+      cohort = factor(cohort, levels = c("Community cohort", "Student cohort")),
+      metric = factor(metric,
+                      levels = c("shannon", "richness"),
+                      labels = c("Shannon diversity", "Observed richness"))
+    ) %>%
+    dplyr::filter(is.finite(value))
+
+  stats <- alpha_long %>%
+    dplyr::group_by(metric) %>%
+    dplyr::summarise(
+      n_community = sum(cohort == "Community cohort"),
+      n_student = sum(cohort == "Student cohort"),
+      p_value = if (dplyr::n_distinct(cohort) == 2 && min(table(cohort)) > 0) {
+        tryCatch(stats::wilcox.test(value ~ cohort)$p.value, error = function(e) NA_real_)
+      } else NA_real_,
+      p_label = dplyr::case_when(
+        is.na(p_value) ~ "",
+        p_value < 0.001 ~ "P < 0.001",
+        TRUE ~ paste0("P = ", signif(p_value, 2))
+      ),
+      y = max(value, na.rm = TRUE) * 1.08,
+      .groups = "drop"
+    )
+
+  p <- ggplot(alpha_long, aes(x = cohort, y = value, fill = cohort)) +
+    geom_violin(trim = FALSE, alpha = 0.45, colour = NA, width = 0.85) +
+    geom_boxplot(width = 0.14, outlier.shape = NA, alpha = 0.85, linewidth = 0.3) +
+    geom_point(position = position_jitter(width = 0.08, height = 0), alpha = 0.35, size = 0.65, show.legend = FALSE) +
+    geom_text(data = stats, aes(x = 1.5, y = y, label = p_label), inherit.aes = FALSE, size = 2.6) +
+    facet_wrap(~ metric, scales = "free_y", nrow = 1) +
+    scale_fill_manual(values = COHORT_COLORS, drop = FALSE) +
+    labs(x = NULL, y = NULL) +
+    fig_theme(base_size = 9, legend_position = "none")
+
+  save_figure(p, filename, width = width, height = height)
+  save_table(alpha_long, paste0(filename, "_data.csv"))
+  save_table(stats, paste0(filename, "_stats.csv"))
+  p
+}
+```
+
+```{r alpha-main-one-file-per-cohort}
+alpha_community <- read_rtk_median_alpha(
+  path = file.path(DATA_DIR, cohort_config$community$alpha_table),
+  cohort_label = "Community cohort",
+  meta = meta_community,
+  level_label = "Selected RTK alpha table"
+)
+
+alpha_student <- read_rtk_median_alpha(
+  path = file.path(DATA_DIR, cohort_config$student$alpha_table),
+  cohort_label = "Student cohort",
+  meta = meta_student,
+  level_label = "Selected RTK alpha table"
+)
+
+alpha_main <- bind_rows(alpha_community, alpha_student)
+
+alpha_source_summary <- alpha_main %>%
+  dplyr::count(cohort, source_file, name = "n_samples")
+
+knitr::kable(alpha_source_summary)
+save_table(alpha_source_summary, "alpha_source_summary.csv")
+
+alpha_ids_community <- unique(alpha_main$sample_id[alpha_main$cohort == "Community cohort"])
+alpha_ids_student <- unique(alpha_main$sample_id[alpha_main$cohort == "Student cohort"])
+
+alpha_sample_diagnostics <- tibble(
+  cohort = c("Community cohort", "Student cohort"),
+  metadata_n = c(nrow(meta_community), nrow(meta_student)),
+  alpha_n = c(length(alpha_ids_community), length(alpha_ids_student)),
+  overlap_n = c(
+    length(intersect(rownames(meta_community), alpha_ids_community)),
+    length(intersect(rownames(meta_student), alpha_ids_student))
+  ),
+  metadata_not_in_alpha_n = c(
+    length(setdiff(rownames(meta_community), alpha_ids_community)),
+    length(setdiff(rownames(meta_student), alpha_ids_student))
+  ),
+  alpha_not_in_metadata_n = c(
+    length(setdiff(alpha_ids_community, rownames(meta_community))),
+    length(setdiff(alpha_ids_student, rownames(meta_student)))
+  )
+)
+
+knitr::kable(alpha_sample_diagnostics)
+save_table(alpha_sample_diagnostics, "alpha_sample_diagnostics.csv")
+
+alpha_missing_samples <- bind_rows(
+  tibble(cohort = "Community cohort", issue = "metadata_not_in_alpha",
+         sample_id = setdiff(rownames(meta_community), alpha_ids_community)),
+  tibble(cohort = "Community cohort", issue = "alpha_not_in_metadata",
+         sample_id = setdiff(alpha_ids_community, rownames(meta_community))),
+  tibble(cohort = "Student cohort", issue = "metadata_not_in_alpha",
+         sample_id = setdiff(rownames(meta_student), alpha_ids_student)),
+  tibble(cohort = "Student cohort", issue = "alpha_not_in_metadata",
+         sample_id = setdiff(alpha_ids_student, rownames(meta_student)))
+)
+save_table(alpha_missing_samples, "alpha_missing_samples.csv")
+
+alpha_summary <- alpha_main %>%
+  tidyr::pivot_longer(c(shannon, richness, simpson, inv_simpson, chao1, evenness),
+                      names_to = "metric", values_to = "value") %>%
+  dplyr::filter(is.finite(value)) %>%
+  dplyr::group_by(cohort, metric) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    median = median(value, na.rm = TRUE),
+    iqr_low = quantile(value, 0.25, na.rm = TRUE),
+    iqr_high = quantile(value, 0.75, na.rm = TRUE),
+    min = min(value, na.rm = TRUE),
+    max = max(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(alpha_summary)
+save_table(alpha_summary, "alpha_main_summary.csv")
+
+p_alpha_main <- plot_alpha_cohort(alpha_main, "alpha_diversity_selected_tables_publication")
+p_alpha_main
+```
+
+**Alpha-diversity interpretation draft.**
+
+```{r alpha-interpretation, results='asis'}
+cat(
+  "Alpha diversity was read from one selected RTK median alpha-diversity table per cohort: ",
+  "`", cohort_config$community$alpha_table, "` for the community cohort and `",
+  cohort_config$student$alpha_table, "` for the student cohort. ",
+  "These cohort-specific inputs avoid mixing RTK outputs from different taxonomic resolutions.\n",
+  sep = ""
+)
+```
+
+# 6. Beta diversity, PCoA, and multivariable taxon models
+
+Stage 1 models include all standardized preference terms plus age, gender, and BMI. Stage 2 adds cohort-specific lifestyle covariates. In the Student cohort, smoking, club membership, and alcohol-consumption frequency are categorical Stage 2 covariates; `not applicable` responses are treated as missing where applicable, and `Never` is the reference level for smoking and alcohol frequency when present. Raw religiousness is not added again as a Community-cohort Stage 2 covariate because standardized religiousness is already a preference exposure in the same model.
+
+```{r model-functions}
+model_value <- function(x, varname = NULL) {
+  if (is.factor(x)) return(droplevels(x))
+  if (is.character(x)) return(factor(clean_missing_strings(x)))
+  if (!is.null(varname) && varname %in% c("gender", "smoking", "marital_status", "clubmember", "alcohol_frequency")) {
+    return(factor(clean_missing_strings(x)))
+  }
+  numify(x)
+}
+
+drop_unused_factor_levels <- function(df) {
+  out <- as.data.frame(df, check.names = FALSE)
+  for (nm in names(out)) {
+    if (is.factor(out[[nm]])) out[[nm]] <- droplevels(out[[nm]])
+  }
+  out
+}
+
+preference_terms <- function(meta) {
+  intersect(paste0("z_", PREFERENCE_CANDIDATES), names(meta))
+}
+
+stage_covariates <- function(meta, cohort_key, stage = c("stage1", "stage2")) {
+  stage <- match.arg(stage)
+  cfg <- cohort_config[[cohort_key]]
+  core <- cfg$stage1
+  extra <- if (stage == "stage2") cfg$stage2 else character(0)
+  vars <- unique(c(core, extra))
+  vars[vars %in% names(meta)]
+}
+
+build_model_design <- function(meta, cohort_key, stage = c("stage1", "stage2"), include_preferences = TRUE) {
+  stage <- match.arg(stage)
+  meta <- as.data.frame(meta, check.names = FALSE)
+
+  # Re-harmonize Student Stage 2 categorical covariates defensively at
+  # model-building time so all downstream model families use identical coding.
+  if (cohort_key == "student" && stage == "stage2") {
+    if ("smoking" %in% names(meta) && length(unique(stats::na.omit(meta$smoking))) > 1) {
+      meta$smoking <- make_smoking_factor(meta$smoking)
+    } else {
+      smoke_col <- find_best_col(
+        meta,
+        c("smoking", "smoking_frequency", "smoke", "smoking_status", "tobacco", "cigarette"),
+        pattern = "smok|tobacco|cigarette"
+      )
+      if (!is.null(smoke_col)) meta$smoking <- make_smoking_factor(meta[[smoke_col]])
+    }
+
+    if ("clubmember" %in% names(meta)) {
+      meta$clubmember <- make_clubmember_factor(meta$clubmember)
+    }
+
+    if ("alcohol_frequency" %in% names(meta)) {
+      meta$alcohol_frequency <- make_alcohol_frequency_factor(meta$alcohol_frequency)
+    }
+  }
+
+  required_covars <- stage_covariates(meta, cohort_key, stage)
+  optional_preferences <- if (include_preferences) preference_terms(meta) else character(0)
+  vars <- unique(c(required_covars, optional_preferences))
+  vars <- vars[vars %in% names(meta)]
+
+  design <- meta[, vars, drop = FALSE]
+  for (v in names(design)) design[[v]] <- model_value(design[[v]], v)
+
+  required_covars <- intersect(required_covars, names(design))
+  informative <- vapply(design, function(x) length(unique(stats::na.omit(x))) > 1, logical(1))
+
+  required_bad <- required_covars[!informative[required_covars]]
+  if (length(required_bad)) {
+    stop(
+      "Required covariate(s) lack variation or are all missing: ",
+      paste(required_bad, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  optional_terms <- setdiff(names(design), required_covars)
+  optional_terms <- optional_terms[informative[optional_terms]]
+  design <- design[, c(required_covars, optional_terms), drop = FALSE]
+
+  # Protect required covariates and drop only non-estimable optional terms.
+  if (ncol(design)) {
+    cc <- stats::complete.cases(design)
+    design_cc <- drop_unused_factor_levels(design[cc, , drop = FALSE])
+
+    if (nrow(design_cc) > 2) {
+      keep_terms <- character(0)
+      for (v in required_covars) {
+        trial <- c(keep_terms, v)
+        mm <- tryCatch(stats::model.matrix(stats::reformulate(trial), data = design_cc), error = function(e) NULL)
+        if (is.null(mm) || qr(mm)$rank < ncol(mm)) {
+          stop(
+            "Required covariate '", v,
+            "' is not estimable after complete-case filtering.",
+            call. = FALSE
+          )
+        }
+        keep_terms <- trial
+      }
+      for (v in setdiff(names(design_cc), required_covars)) {
+        trial <- c(keep_terms, v)
+        mm <- tryCatch(stats::model.matrix(stats::reformulate(trial), data = design_cc), error = function(e) NULL)
+        if (!is.null(mm) && qr(mm)$rank == ncol(mm)) keep_terms <- trial
+      }
+      design <- design[, keep_terms, drop = FALSE]
+    }
+  }
+
+  if (cohort_key == "student" && stage == "stage2") {
+    required_student_stage2 <- LIFESTYLE_CANDIDATES_STUDENT
+    missing_stage2 <- setdiff(required_student_stage2, names(design))
+    if (length(missing_stage2)) {
+      stop(
+        "Student cohort Stage 2 design lost required covariate(s): ",
+        paste(missing_stage2, collapse = ", "),
+        call. = FALSE
+      )
+    }
+
+    design$smoking <- droplevels(make_smoking_factor(design$smoking))
+    design$clubmember <- droplevels(make_clubmember_factor(design$clubmember))
+    design$alcohol_frequency <- droplevels(make_alcohol_frequency_factor(design$alcohol_frequency))
+  }
+
+  design
+}
+
+write_design_audit <- function(design, cohort_key, level_label, stage_label, phase = "final") {
+  design <- as.data.frame(design, check.names = FALSE)
+  audit <- tibble(
+    cohort = cohort_config[[cohort_key]]$cohort,
+    level = level_label,
+    stage = stage_label,
+    phase = phase,
+    n_model_samples = nrow(design),
+    variable = names(design),
+    class = vapply(design, function(x) paste(class(x), collapse = "/"), character(1)),
+    n_non_missing = vapply(design, function(x) sum(!is.na(x)), integer(1)),
+    n_levels_or_unique = vapply(design, function(x) length(unique(stats::na.omit(x))), integer(1)),
+    levels = vapply(design, function(x) {
+      if (is.factor(x) || is.character(x)) {
+        paste(head(unique(stats::na.omit(as.character(x))), 10), collapse = " | ")
+      } else ""
+    }, character(1))
+  )
+  save_table(
+    audit,
+    paste0("design_audit_", cohort_key, "_", stage_label, "_", tolower(level_label), "_", phase, ".csv")
+  )
+  audit
+}
+
+run_permanova <- function(feature_mat, meta, cohort_key, level_label, stage_label, permutations = PERMUTATIONS) {
+  if (is.null(feature_mat)) return(tibble())
+  aligned <- align_feature_to_meta(feature_mat, meta)
+
+  comm <- t(aligned$feature)
+  suppressWarnings(storage.mode(comm) <- "numeric")
+  comm[!is.finite(comm)] <- 0
+  comm <- comm[rowSums(comm, na.rm = TRUE) > 0, , drop = FALSE]
+  comm <- comm[, colSums(comm, na.rm = TRUE) > 0, drop = FALSE]
+
+  design <- build_model_design(
+    aligned$meta[rownames(comm), , drop = FALSE],
+    cohort_key = cohort_key,
+    stage = stage_label,
+    include_preferences = TRUE
+  )
+  cc <- stats::complete.cases(design)
+  design <- drop_unused_factor_levels(design[cc, , drop = FALSE])
+  comm <- comm[rownames(design), , drop = FALSE]
+
+  if (nrow(comm) < 5 || ncol(comm) < 2 || ncol(design) < 1) return(tibble())
+
+  rel <- vegan::decostand(comm, method = "total")
+  rel[!is.finite(rel)] <- 0
+  bray <- vegan::vegdist(rel, method = "bray")
+  set.seed(RANDOM_SEED)
+  ad <- tryCatch(
+    vegan::adonis2(bray ~ ., data = design, permutations = permutations, by = "margin"),
+    error = function(e) {
+      warning("PERMANOVA failed for ", cohort_key, "/", level_label, "/", stage_label, ": ", conditionMessage(e))
+      NULL
+    }
+  )
+  if (is.null(ad)) return(tibble())
+
+  as.data.frame(ad) %>%
+    tibble::rownames_to_column("term") %>%
+    dplyr::mutate(
+      cohort = cohort_config[[cohort_key]]$cohort,
+      cohort_key = cohort_key,
+      level = level_label,
+      stage = stage_label,
+      n_samples = nrow(design),
+      permutations = permutations,
+      model_terms = paste(names(design), collapse = "; ")
+    )
+}
+
+plot_pcoa_ecological <- function(feature_mat, meta, cohort_label, level_label, filename, width = 6.5, height = 4.8) {
+  if (is.null(feature_mat)) return(NULL)
+  aligned <- align_feature_to_meta(feature_mat, meta)
+
+  comm <- t(aligned$feature)
+  suppressWarnings(storage.mode(comm) <- "numeric")
+  comm[!is.finite(comm)] <- 0
+  comm <- comm[rowSums(comm, na.rm = TRUE) > 0, , drop = FALSE]
+  comm <- comm[, colSums(comm, na.rm = TRUE) > 0, drop = FALSE]
+  if (nrow(comm) < 5 || ncol(comm) < 2) return(NULL)
+
+  rel <- vegan::decostand(comm, method = "total")
+  rel[!is.finite(rel)] <- 0
+  bray <- vegan::vegdist(rel, method = "bray")
+  pcoa <- stats::cmdscale(bray, eig = TRUE, k = 2, add = TRUE)
+
+  positive_eig <- pcoa$eig[pcoa$eig > 0]
+  explained <- if (length(positive_eig) >= 2) {
+    100 * pmax(pcoa$eig[1:2], 0) / sum(positive_eig)
+  } else c(NA_real_, NA_real_)
+
+  plot_df <- tibble(
+    sample_id = rownames(rel),
+    PCoA1 = pcoa$points[, 1],
+    PCoA2 = pcoa$points[, 2]
+  ) %>%
+    dplyr::left_join(
+      meta_with_sample_id(aligned$meta) %>%
+        dplyr::select(sample_id, ecological_preference_q),
+      by = "sample_id"
+    ) %>%
+    dplyr::mutate(
+      ecological_preference_q = as.character(ecological_preference_q),
+      ecological_preference_q = dplyr::if_else(
+        is.na(ecological_preference_q) | ecological_preference_q == "",
+        "Missing",
+        ecological_preference_q
+      ),
+      ecological_preference_q = factor(
+        ecological_preference_q,
+        levels = names(ECOLOGICAL_QUARTILE_COLORS)
+      )
+    ) %>%
+    dplyr::filter(is.finite(PCoA1), is.finite(PCoA2))
+
+  ellipse_groups <- plot_df %>%
+    dplyr::group_by(ecological_preference_q) %>%
+    dplyr::summarise(
+      n = dplyr::n(),
+      n_unique = dplyr::n_distinct(paste(PCoA1, PCoA2)),
+      var_x = stats::var(PCoA1),
+      var_y = stats::var(PCoA2),
+      .groups = "drop"
+    ) %>%
+    dplyr::filter(n >= 4, n_unique >= 4, is.finite(var_x), var_x > 0, is.finite(var_y), var_y > 0)
+
+  ellipse_df <- plot_df %>%
+    dplyr::semi_join(ellipse_groups, by = "ecological_preference_q")
+
+  x_lab <- if (is.finite(explained[1])) sprintf("PCoA 1 (%.1f%%)", explained[1]) else "PCoA 1"
+  y_lab <- if (is.finite(explained[2])) sprintf("PCoA 2 (%.1f%%)", explained[2]) else "PCoA 2"
+
+  p <- ggplot(plot_df, aes(x = PCoA1, y = PCoA2, colour = ecological_preference_q)) +
+    geom_point(size = 1.8, alpha = 0.85) +
+    stat_ellipse(data = ellipse_df, linewidth = 0.3, alpha = 0.35, show.legend = FALSE) +
+    scale_colour_manual(values = ECOLOGICAL_QUARTILE_COLORS, drop = FALSE) +
+    labs(x = x_lab, y = y_lab, colour = "Ecological preference score") +
+    fig_theme(base_size = 9, legend_position = "right")
+
+  save_figure(p, filename, width = width, height = height, out_dir = SUPP_DIR)
+  save_table(plot_df, paste0(filename, "_data.csv"))
+  save_table(ellipse_groups, paste0(filename, "_ellipse_groups.csv"))
+  p
+}
+
+run_maaslin2_for_table <- function(feature_mat, meta, cohort_key, level_label, stage_label) {
+  if (!RUN_MAASLIN) return(tibble())
+  if (!requireNamespace("Maaslin2", quietly = TRUE)) {
+    stop("Package 'Maaslin2' is required when RUN_MAASLIN is TRUE.")
+  }
+  if (is.null(feature_mat)) return(tibble())
+
+  aligned <- align_feature_to_meta(feature_mat, meta)
+  ft <- t(aligned$feature)
+  suppressWarnings(storage.mode(ft) <- "numeric")
+  ft[!is.finite(ft)] <- 0
+  ft <- ft[rowSums(ft, na.rm = TRUE) > 0, , drop = FALSE]
+  ft <- ft[, colSums(ft, na.rm = TRUE) > 0, drop = FALSE]
+  if (nrow(ft) < 5 || ncol(ft) < 2) return(tibble())
+
+  design <- build_model_design(
+    aligned$meta[rownames(ft), , drop = FALSE],
+    cohort_key,
+    stage_label,
+    include_preferences = TRUE
+  )
+  cc <- stats::complete.cases(design)
+  design <- drop_unused_factor_levels(design[cc, , drop = FALSE])
+  ft <- ft[rownames(design), , drop = FALSE]
+  if (nrow(ft) < 5 || ncol(ft) < 2 || ncol(design) < 1) return(tibble())
+
+  if (cohort_key == "student" && stage_label == "stage2") {
+    required_student_stage2 <- LIFESTYLE_CANDIDATES_STUDENT
+    missing_stage2 <- setdiff(required_student_stage2, names(design))
+    if (length(missing_stage2)) {
+      stop(
+        "Student cohort Stage 2 MaAsLin2 design does not include: ",
+        paste(missing_stage2, collapse = ", "),
+        call. = FALSE
+      )
+    }
+
+    design$smoking <- droplevels(make_smoking_factor(design$smoking))
+    design$clubmember <- droplevels(make_clubmember_factor(design$clubmember))
+    design$alcohol_frequency <- droplevels(make_alcohol_frequency_factor(design$alcohol_frequency))
+
+    low_level <- required_student_stage2[
+      vapply(design[required_student_stage2], nlevels, integer(1)) < 2
+    ]
+    if (length(low_level)) {
+      stop(
+        "Student cohort Stage 2 covariate(s) have fewer than two observed levels after filtering: ",
+        paste(low_level, collapse = ", "),
+        call. = FALSE
+      )
+    }
+  }
+
+  write_design_audit(design, cohort_key, level_label, stage_label, phase = "final")
+
+  cohort_dir <- file.path(RESULTS_DIR, cohort_config[[cohort_key]]$internal)
+  maaslin_dir <- file.path(cohort_dir, paste0("maaslin_", stage_label, "_", tolower(level_label)))
+  dir.create(cohort_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(maaslin_dir, recursive = TRUE, showWarnings = FALSE)
+
+  readr::write_delim(
+    meta_with_sample_id(design),
+    file.path(cohort_dir, paste0("maaslin_design_", stage_label, "_", tolower(level_label), "_semicolon.csv")),
+    delim = ";", na = ""
+  )
+
+  suppressWarnings(Maaslin2::Maaslin2(
+    input_data = as.data.frame(ft, check.names = FALSE),
+    input_metadata = as.data.frame(design, check.names = FALSE),
+    output = maaslin_dir,
+    normalization = "TSS",
+    transform = "LOG",
+    analysis_method = "LM",
+    min_prevalence = 0.10,
+    max_significance = FDR_THRESHOLD,
+    standardize = FALSE,
+    plot_heatmap = FALSE,
+    plot_scatter = FALSE,
+    cores = MAASLIN_CORES
+  ))
+
+  res_file <- file.path(maaslin_dir, "all_results.tsv")
+  if (!file.exists(res_file)) return(tibble())
+
+  out <- readr::read_tsv(res_file, show_col_types = FALSE) %>%
+    janitor::clean_names() %>%
+    dplyr::mutate(
+      cohort = cohort_config[[cohort_key]]$cohort,
+      cohort_key = cohort_key,
+      level = tolower(level_label),
+      stage = stage_label,
+      n_samples = nrow(design),
+      model_terms = paste(names(design), collapse = "; ")
+    )
+
+  readr::write_delim(
+    out,
+    file.path(cohort_dir, paste0("maaslin_", stage_label, "_", tolower(level_label), "_semicolon.csv")),
+    delim = ";", na = ""
+  )
+  out
+}
+```
+
+## 6.0 Alpha-diversity preference models
+
+The descriptive between-cohort alpha-diversity figure above is complemented by within-cohort multivariable models. Shannon diversity and observed richness are modelled separately using the same Stage 1 and Stage 2 design logic as the community-composition and taxon-level analyses. Benjamini--Hochberg correction is applied across all preference coefficients for the two alpha-diversity outcomes within each cohort and stage.
+
+```{r alpha-preference-models}
+run_alpha_preference_models <- function(alpha_df, meta, cohort_key, stage_label) {
+  if (is.null(alpha_df) || !nrow(alpha_df)) return(tibble())
+
+  common <- intersect(alpha_df$sample_id, rownames(meta))
+  if (length(common) < 5) return(tibble())
+
+  meta2 <- meta[match(common, rownames(meta)), , drop = FALSE]
+  rownames(meta2) <- common
+  alpha2 <- alpha_df[match(common, alpha_df$sample_id), , drop = FALSE]
+
+  design <- build_model_design(
+    meta2,
+    cohort_key = cohort_key,
+    stage = stage_label,
+    include_preferences = TRUE
+  )
+  alpha2 <- alpha2[match(rownames(design), alpha2$sample_id), , drop = FALSE]
+
+  outcomes <- c("shannon", "richness")
+  pref_terms <- preference_terms(meta2)
+
+  purrr::map_dfr(outcomes, function(outcome_name) {
+    if (!outcome_name %in% names(alpha2)) return(tibble())
+    y <- numify(alpha2[[outcome_name]])
+    dat <- dplyr::bind_cols(tibble(outcome_value = y), design)
+
+    fit <- tryCatch(
+      stats::lm(
+        stats::reformulate(names(design), response = "outcome_value"),
+        data = dat,
+        na.action = stats::na.omit
+      ),
+      error = function(e) {
+        warning(
+          "Alpha-diversity model failed for ", cohort_key, "/", stage_label,
+          "/", outcome_name, ": ", conditionMessage(e),
+          call. = FALSE
+        )
+        NULL
+      }
+    )
+    if (is.null(fit)) return(tibble())
+
+    broom::tidy(fit, conf.int = TRUE) %>%
+      dplyr::mutate(
+        cohort = cohort_config[[cohort_key]]$cohort,
+        cohort_key = cohort_key,
+        stage = stage_label,
+        outcome = dplyr::recode(
+          outcome_name,
+          shannon = "Shannon diversity",
+          richness = "Observed richness"
+        ),
+        n_samples = stats::nobs(fit),
+        model_terms = paste(names(design), collapse = "; "),
+        is_preference = term %in% pref_terms
+      )
+  })
+}
+
+alpha_model_results_raw <- dplyr::bind_rows(
+  run_alpha_preference_models(alpha_community, meta_community, "community", "stage1"),
+  run_alpha_preference_models(alpha_community, meta_community, "community", "stage2"),
+  run_alpha_preference_models(alpha_student, meta_student, "student", "stage1"),
+  run_alpha_preference_models(alpha_student, meta_student, "student", "stage2")
+)
+
+if (!nrow(alpha_model_results_raw)) {
+  stop("No alpha-diversity preference model could be fitted. Inspect alpha sample overlap and model-design audits.", call. = FALSE)
+}
+
+alpha_preference_adjusted <- alpha_model_results_raw %>%
+  dplyr::filter(is_preference, is.finite(p.value)) %>%
+  dplyr::group_by(cohort, stage) %>%
+  dplyr::mutate(q_alpha = stats::p.adjust(p.value, method = "BH")) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(cohort, stage, outcome, term, q_alpha)
+
+alpha_model_results <- alpha_model_results_raw %>%
+  dplyr::left_join(
+    alpha_preference_adjusted,
+    by = c("cohort", "stage", "outcome", "term")
+  )
+
+alpha_preference_results <- alpha_model_results %>%
+  dplyr::filter(is_preference) %>%
+  dplyr::mutate(
+    preference = unname(PREFERENCE_LABELS[term]),
+    preference = dplyr::if_else(is.na(preference), term, preference)
+  )
+
+alpha_preference_summary <- alpha_preference_results %>%
+  dplyr::group_by(cohort, stage) %>%
+  dplyr::summarise(
+    n_tests = dplyr::n(),
+    n_nominal = sum(p.value < NOMINAL_THRESHOLD, na.rm = TRUE),
+    n_fdr = sum(q_alpha <= FDR_THRESHOLD, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+alpha_preference_fdr_hits <- alpha_preference_results %>%
+  dplyr::filter(is.finite(q_alpha), q_alpha <= FDR_THRESHOLD) %>%
+  dplyr::arrange(q_alpha, p.value)
+
+save_table(alpha_model_results, "alpha_model_stage1_stage2_all.csv")
+save_table(alpha_preference_results, "alpha_preference_associations.csv")
+save_table(alpha_preference_summary, "alpha_preference_summary.csv")
+save_table(alpha_preference_fdr_hits, "alpha_preference_fdr_hits.csv")
+knitr::kable(alpha_preference_summary)
+```
+
+## 6.1 Ecological-preference PCoA plots
+
+Colours represent cohort-specific quartiles of the standardized ecological-preference score, from `Q1 lowest` to `Q4 highest`. Missing scores are shown separately. Ellipses are visual guides and are drawn only for groups with sufficient non-degenerate data.
+
+```{r pcoa-ecological-quartiles}
+# Use genus-level profiles in both cohorts so the visual comparison is based on
+# the same taxonomic resolution. Quartiles are calculated within each cohort.
+p_pcoa_community_genus <- plot_pcoa_ecological(
+  features$community_genus,
+  meta_community,
+  cohort_label = "Community cohort",
+  level_label = "genus",
+  filename = "pcoa_community_genus_ecological_quartiles"
+)
+
+p_pcoa_student_genus <- plot_pcoa_ecological(
+  features$student_genus,
+  meta_student,
+  cohort_label = "Student cohort",
+  level_label = "genus",
+  filename = "pcoa_student_genus_ecological_quartiles"
+)
+
+p_pcoa_community_genus
+p_pcoa_student_genus
+```
+
+## 6.2 PERMANOVA
+
+```{r beta-permanova-stage1-stage2}
+permanova_results <- dplyr::bind_rows(
+  run_permanova(features$community_genus, meta_community, "community", "Genus", "stage1"),
+  run_permanova(features$community_genus, meta_community, "community", "Genus", "stage2"),
+  run_permanova(features$student_genus, meta_student, "student", "Genus", "stage1"),
+  run_permanova(features$student_genus, meta_student, "student", "Genus", "stage2")
+)
+
+knitr::kable(permanova_results)
+save_table(permanova_results, "permanova_genus_stage1_stage2.csv")
+```
+
+```{r permanova-preference-figure}
+permanova_plot_df <- permanova_results %>%
+  dplyr::filter(term %in% names(PREFERENCE_LABELS)) %>%
+  dplyr::mutate(
+    preference = unname(PREFERENCE_LABELS[term]),
+    cohort = factor(cohort, levels = c("Community cohort", "Student cohort")),
+    stage_label = factor(stage, levels = c("stage1", "stage2"), labels = c("Stage 1", "Stage 2")),
+    nominal = .data[["Pr(>F)"]] < NOMINAL_THRESHOLD,
+    partial_r2_percent = 100 * R2
+  ) %>%
+  dplyr::filter(is.finite(partial_r2_percent))
+
+if (nrow(permanova_plot_df)) {
+  p_permanova <- ggplot(
+    permanova_plot_df,
+    aes(
+      x = partial_r2_percent,
+      y = forcats::fct_reorder(preference, partial_r2_percent),
+      colour = preference,
+      shape = nominal
+    )
+  ) +
+    geom_point(size = 2.3) +
+    facet_grid(cohort ~ stage_label, scales = "free_y", drop = FALSE) +
+    scale_colour_manual(values = PREFERENCE_COLORS, drop = FALSE) +
+    scale_shape_manual(
+      values = c(`FALSE` = 1, `TRUE` = 16),
+      labels = c(`FALSE` = paste0("P >= ", NOMINAL_THRESHOLD), `TRUE` = paste0("P < ", NOMINAL_THRESHOLD))
+    ) +
+    labs(x = "Partial R-squared (%)", y = NULL, colour = "Preference", shape = "Nominal association") +
+    fig_theme(base_size = 9)
+
+  save_figure(p_permanova, "permanova_preferences_partial_r2_publication", width = 9.2, height = 6.0)
+  save_table(permanova_plot_df, "permanova_preferences_partial_r2_publication_data.csv")
+  p_permanova
+}
+```
+
+## 6.3 MaAsLin2
+
+```{r maaslin-stage1-stage2}
+if (RUN_MAASLIN) {
+  maaslin_result_list <- list(
+    run_maaslin2_for_table(features$community_family, meta_community, "community", "family", "stage1"),
+    run_maaslin2_for_table(features$community_family, meta_community, "community", "family", "stage2"),
+    run_maaslin2_for_table(features$community_genus, meta_community, "community", "genus", "stage1"),
+    run_maaslin2_for_table(features$community_genus, meta_community, "community", "genus", "stage2"),
+    run_maaslin2_for_table(features$student_family, meta_student, "student", "family", "stage1"),
+    run_maaslin2_for_table(features$student_family, meta_student, "student", "family", "stage2"),
+    run_maaslin2_for_table(features$student_genus, meta_student, "student", "genus", "stage1"),
+    run_maaslin2_for_table(features$student_genus, meta_student, "student", "genus", "stage2")
+  )
+
+  if (RUN_SPECIES_MAASLIN) {
+    # Species-level analysis is scientifically supported for the Community-cohort
+    # shotgun metagenomic profile only. Do not add Student-cohort 16S species calls.
+    if (is.null(features$community_species)) {
+      stop("Community-cohort shotgun species table is unavailable, but run_shotgun_species_maaslin is TRUE.", call. = FALSE)
+    }
+    maaslin_result_list <- c(
+      maaslin_result_list,
+      list(
+        run_maaslin2_for_table(features$community_species, meta_community, "community", "species", "stage1"),
+        run_maaslin2_for_table(features$community_species, meta_community, "community", "species", "stage2")
+      )
+    )
+  }
+
+  maaslin_results <- dplyr::bind_rows(maaslin_result_list)
+} else {
+  source_file <- if (!is.null(SOURCE_RUN_DIR)) {
+    file.path(SOURCE_RUN_DIR, "tables", "maaslin_stage1_stage2_all.csv")
+  } else NA_character_
+
+  if (!is.na(source_file) && file.exists(source_file)) {
+    maaslin_results <- readr::read_csv(source_file, show_col_types = FALSE) %>% janitor::clean_names()
+    message("Loaded MaAsLin2 results from: ", source_file)
+  } else {
+    maaslin_results <- tibble()
+    warning("MaAsLin2 was not run and no valid source_run_dir was supplied.", call. = FALSE)
+  }
+}
+
+if (nrow(maaslin_results)) save_table(maaslin_results, "maaslin_stage1_stage2_all.csv")
+
+maaslin_model_coverage <- if (nrow(maaslin_results)) {
+  maaslin_results %>%
+    dplyr::distinct(cohort, cohort_key, stage, level, n_samples, model_terms) %>%
+    dplyr::arrange(cohort, stage, level)
+} else {
+  tibble(
+    cohort = character(0), cohort_key = character(0), stage = character(0),
+    level = character(0), n_samples = integer(0), model_terms = character(0)
+  )
+}
+save_table(maaslin_model_coverage, "maaslin_model_coverage.csv")
+knitr::kable(maaslin_model_coverage)
+
+species_analysis_scope <- tibble(
+  requested = RUN_SPECIES_MAASLIN,
+  community_shotgun_species_models = if (nrow(maaslin_results)) sum(
+    maaslin_results$cohort_key == "community" & tolower(maaslin_results$level) == "species",
+    na.rm = TRUE
+  ) else 0L,
+  student_16s_species_models = if (nrow(maaslin_results)) sum(
+    maaslin_results$cohort_key == "student" & tolower(maaslin_results$level) == "species",
+    na.rm = TRUE
+  ) else 0L,
+  scope_valid = if (!RUN_SPECIES_MAASLIN) TRUE else (
+    any(maaslin_model_coverage$cohort_key == "community" & tolower(maaslin_model_coverage$level) == "species") &&
+      !any(maaslin_model_coverage$cohort_key == "student" & tolower(maaslin_model_coverage$level) == "species")
+  )
+)
+save_table(species_analysis_scope, "species_analysis_scope.csv")
+knitr::kable(species_analysis_scope)
+```
+
+```{r maaslin-model-audits}
+student_stage2_covariate_design <- build_model_design(meta_student, "student", "stage2", include_preferences = FALSE)
+student_stage2_covariate_design <- drop_unused_factor_levels(
+  student_stage2_covariate_design[stats::complete.cases(student_stage2_covariate_design), , drop = FALSE]
+)
+
+student_stage2_full_design <- build_model_design(meta_student, "student", "stage2", include_preferences = TRUE)
+student_stage2_full_design <- drop_unused_factor_levels(
+  student_stage2_full_design[stats::complete.cases(student_stage2_full_design), , drop = FALSE]
+)
+
+student_stage2_required <- LIFESTYLE_CANDIDATES_STUDENT
+
+student_stage2_check <- dplyr::bind_rows(
+  purrr::map_dfr(student_stage2_required, function(v) {
+    tibble(
+      variable = v,
+      present_covariate_design = v %in% names(student_stage2_covariate_design),
+      factor_covariate_design = v %in% names(student_stage2_covariate_design) && is.factor(student_stage2_covariate_design[[v]]),
+      n_levels_covariate_design = if (v %in% names(student_stage2_covariate_design)) nlevels(droplevels(student_stage2_covariate_design[[v]])) else 0L,
+      present_full_design = v %in% names(student_stage2_full_design),
+      factor_full_design = v %in% names(student_stage2_full_design) && is.factor(student_stage2_full_design[[v]]),
+      n_levels_full_design = if (v %in% names(student_stage2_full_design)) nlevels(droplevels(student_stage2_full_design[[v]])) else 0L
+    )
+  }),
+  tibble(
+    variable = "__design_terms__",
+    present_covariate_design = TRUE,
+    factor_covariate_design = NA,
+    n_levels_covariate_design = NA_integer_,
+    present_full_design = TRUE,
+    factor_full_design = NA,
+    n_levels_full_design = NA_integer_
+  )
+)
+
+student_stage2_design_terms <- tibble(
+  design = c("covariates_only", "full_with_preferences"),
+  terms = c(
+    paste(names(student_stage2_covariate_design), collapse = "; "),
+    paste(names(student_stage2_full_design), collapse = "; ")
+  ),
+  n_samples = c(nrow(student_stage2_covariate_design), nrow(student_stage2_full_design))
+)
+
+knitr::kable(student_stage2_check)
+knitr::kable(student_stage2_design_terms)
+save_table(student_stage2_check, "student_stage2_covariate_check.csv")
+save_table(student_stage2_design_terms, "student_stage2_design_terms.csv")
+
+stopifnot(
+  all(student_stage2_check$present_covariate_design[student_stage2_check$variable %in% student_stage2_required]),
+  all(student_stage2_check$factor_covariate_design[student_stage2_check$variable %in% student_stage2_required]),
+  all(student_stage2_check$n_levels_covariate_design[student_stage2_check$variable %in% student_stage2_required] > 1),
+  all(student_stage2_check$present_full_design[student_stage2_check$variable %in% student_stage2_required]),
+  all(student_stage2_check$factor_full_design[student_stage2_check$variable %in% student_stage2_required]),
+  all(student_stage2_check$n_levels_full_design[student_stage2_check$variable %in% student_stage2_required] > 1)
+)
+
+student_stage2_term_check <- if (nrow(maaslin_results)) {
+  maaslin_results %>%
+    dplyr::filter(cohort == "Student cohort", stage == "stage2") %>%
+    dplyr::distinct(level, model_terms) %>%
+    dplyr::mutate(
+      smoking_in_model_terms = stringr::str_detect(model_terms, "(^|; )smoking($|; )"),
+      clubmember_in_model_terms = stringr::str_detect(model_terms, "(^|; )clubmember($|; )"),
+      alcohol_frequency_in_model_terms = stringr::str_detect(model_terms, "(^|; )alcohol_frequency($|; )"),
+      all_student_stage2_covariates_present = smoking_in_model_terms & clubmember_in_model_terms & alcohol_frequency_in_model_terms
+    )
+} else {
+  tibble(
+    level = character(0), model_terms = character(0),
+    smoking_in_model_terms = logical(0), clubmember_in_model_terms = logical(0),
+    alcohol_frequency_in_model_terms = logical(0), all_student_stage2_covariates_present = logical(0)
+  )
+}
+
+save_table(student_stage2_term_check, "student_stage2_model_term_check.csv")
+if (nrow(student_stage2_term_check) && any(!student_stage2_term_check$all_student_stage2_covariates_present)) {
+  stop("At least one Student cohort Stage 2 MaAsLin2 model is missing a required Stage 2 covariate.", call. = FALSE)
+}
+
+compare_student_stages <- function(df) {
+  required <- c("cohort", "stage", "level", "feature", "metadata", "value", "coef")
+  if (is.null(df) || !nrow(df) || !all(required %in% names(df))) return(tibble())
+  df %>%
+    dplyr::filter(cohort == "Student cohort", stage %in% c("stage1", "stage2")) %>%
+    dplyr::select(level, feature, metadata, value, stage, coef) %>%
+    tidyr::pivot_wider(names_from = stage, values_from = coef) %>%
+    dplyr::filter(is.finite(stage1), is.finite(stage2)) %>%
+    dplyr::group_by(level) %>%
+    dplyr::summarise(
+      n_common_coefficients = dplyr::n(),
+      max_absolute_difference = max(abs(stage2 - stage1), na.rm = TRUE),
+      median_absolute_difference = median(abs(stage2 - stage1), na.rm = TRUE),
+      effectively_identical = max_absolute_difference <= 1e-12,
+      .groups = "drop"
+    )
+}
+
+student_stage_comparison <- compare_student_stages(maaslin_results)
+knitr::kable(student_stage_comparison)
+save_table(student_stage_comparison, "student_stage1_stage2_coefficient_comparison.csv")
+
+if (nrow(student_stage_comparison) && any(student_stage_comparison$effectively_identical)) {
+  stop("Student cohort Stage 1 and Stage 2 coefficients are exactly duplicated for at least one taxonomic level.", call. = FALSE)
+}
+```
+
+# 7. Taxon-level figures
+
+The main figure shows every taxon-level association passing the prespecified FDR threshold (`q <= 0.10`). Cohort and model stage are shown in a fixed 2-by-2 facet layout. Empty panels are labelled explicitly rather than assigned zero height; this prevents the non-finite viewport error that occurred when no Community-cohort association passed FDR correction. Preference colours are identical in the PERMANOVA, main taxon, and supplementary taxon figures.
+
+```{r taxon-figure-functions}
+pretty_stage <- function(x) {
+  dplyr::recode(as.character(x), stage1 = "Stage 1", stage2 = "Stage 2", .default = as.character(x))
+}
+
+pretty_level <- function(x) stringr::str_to_title(as.character(x))
+
+pretty_term <- function(metadata) {
+  metadata <- as.character(metadata)
+  out <- unname(PREFERENCE_LABELS[metadata])
+  out[is.na(out) & metadata == "age"] <- "Age"
+  out[is.na(out) & metadata == "bmi"] <- "BMI"
+  out[is.na(out) & metadata == "gender"] <- "Gender"
+  out[is.na(out) & metadata == "smoking"] <- "Smoking"
+  out[is.na(out) & metadata == "alcohol"] <- "Alcohol"
+  out[is.na(out) & metadata == "alcohol_frequency"] <- "Alcohol frequency"
+  out[is.na(out) & metadata == "clubmember"] <- "Club membership"
+  out[is.na(out)] <- "Other covariate"
+  out
+}
+
+pretty_predictor_value <- function(metadata, value) {
+  base <- pretty_term(metadata)
+  value <- as.character(value)
+  factor_term <- metadata %in% c("gender", "smoking", "marital_status", "clubmember", "alcohol_frequency")
+  val_ok <- !is.na(value) & value != "" & value != metadata
+  out <- base
+  out[factor_term & val_ok] <- paste0(base[factor_term & val_ok], ": ", value[factor_term & val_ok])
+  out
+}
+
+pretty_taxon_one <- function(one) {
+  if (is.na(one) || !nzchar(stringr::str_trim(one))) return("Unassigned taxon")
+
+  one <- as.character(one)
+  one <- stringr::str_replace(one, "^(Bacteria|Archaea)[.;]", "")
+  one <- stringr::str_replace_all(one, "_", " ")
+
+  # mOTU-style labels often contain a readable organism name before the
+  # technical ref/meta/ext_mOTU identifier. Preserve that readable part.
+  if (stringr::str_detect(one, "(?i)(ref|meta|ext) mOTU")) {
+    clean <- stringr::str_remove(one, "(?i)[.; ]+(ref|meta|ext) mOTU.*$")
+    clean <- stringr::str_replace_all(clean, "[.;]+", " ")
+    clean <- stringr::str_squish(clean)
+    clean <- stringr::str_replace_all(clean, "\\bsp\\b", "sp.")
+    clean <- stringr::str_replace_all(clean, "\\bgen\\b", "gen.")
+    clean <- stringr::str_replace_all(clean, "\\bfam\\b", "fam.")
+
+    # Prefer a full incertae-sedis label, then genus + sp./CAG, then a binomial.
+    incertae <- stringr::str_extract(
+      clean,
+      "^[A-Za-z0-9-]+\\s+species\\s+incertae\\s+sedis"
+    )
+    if (!is.na(incertae)) return(stringr::str_trunc(incertae, width = 52))
+
+    sp_label <- stringr::str_extract(
+      clean,
+      "^[A-Z][A-Za-z0-9-]+\\s+sp\\.(?:\\s+CAG\\s+[0-9]+)?"
+    )
+    if (!is.na(sp_label)) return(stringr::str_trunc(sp_label, width = 52))
+
+    binomial <- stringr::str_extract(clean, "^[A-Z][A-Za-z0-9-]+\\s+[a-z][A-Za-z0-9-]+")
+    if (!is.na(binomial) && !stringr::str_detect(binomial, "\\s+(gen|fam|species)$")) {
+      return(stringr::str_trunc(binomial, width = 52))
+    }
+
+    # For ambiguous rank strings, use the last informative assignment.
+    tokens <- unlist(stringr::str_split(clean, "\\s+"))
+    tokens <- tokens[
+      tokens != "" &
+        !stringr::str_detect(tokens, "^(species|incertae|sedis|gen\\.|fam\\.|sp\\.|CAG|[0-9]+)$")
+    ]
+    if (length(tokens)) return(stringr::str_trunc(tail(tokens, 1), width = 52))
+  }
+
+  # GTDB / hierarchical labels: use the most specific informative rank.
+  parts <- unlist(stringr::str_split(one, "[.;|]"))
+  parts <- stringr::str_trim(parts)
+  parts <- stringr::str_replace(parts, "^[dkpcofgs]__", "")
+  parts <- parts[
+    parts != "" &
+      !stringr::str_detect(
+        parts,
+        "^(Bacteria|Archaea|incertae|sedis|species|gen|fam|order|class|phylum|unassigned|noHit|NA)$"
+      )
+  ]
+  if (!length(parts)) return("Unassigned taxon")
+
+  ans <- tail(parts, 1)
+  ans <- stringr::str_squish(ans)
+  stringr::str_trunc(ans, width = 52)
+}
+
+pretty_taxon <- function(x) {
+  vapply(as.character(x), pretty_taxon_one, character(1))
+}
+
+prepare_maaslin_plot_data <- function(df) {
+  if (is.null(df) || !nrow(df)) return(tibble())
+  df <- df %>% janitor::clean_names()
+  required <- c("feature", "metadata", "value", "coef", "stderr", "pval", "qval", "cohort", "level", "stage")
+  missing <- setdiff(required, names(df))
+  if (length(missing)) stop("MaAsLin2 results lack required columns: ", paste(missing, collapse = ", "))
+
+  df %>%
+    dplyr::transmute(
+      cohort = factor(pretty_cohort(cohort), levels = c("Community cohort", "Student cohort")),
+      stage = factor(pretty_stage(stage), levels = c("Stage 1", "Stage 2")),
+      level = factor(pretty_level(level), levels = c("Family", "Genus", "Species")),
+      feature = as.character(feature),
+      taxon_short = pretty_taxon(feature),
+      taxon_axis = paste0(taxon_short, " [", tolower(as.character(level)), "]"),
+      metadata = as.character(metadata),
+      value = as.character(value),
+      estimate = as.numeric(coef),
+      stderr = as.numeric(stderr),
+      p = as.numeric(pval),
+      q = as.numeric(qval),
+      predictor = pretty_term(metadata),
+      predictor_value = pretty_predictor_value(metadata, value),
+      association_type = factor(ifelse(startsWith(metadata, "z_"), "Preference", "Covariate"), levels = c("Preference", "Covariate")),
+      colour_key = predictor,
+      conf_low = estimate - 1.96 * stderr,
+      conf_high = estimate + 1.96 * stderr
+    ) %>%
+    dplyr::filter(
+      !is.na(cohort), !is.na(stage), !is.na(level),
+      is.finite(estimate), is.finite(stderr), stderr >= 0,
+      is.finite(p), is.finite(conf_low), is.finite(conf_high)
+    )
+}
+
+add_unique_axis_rows <- function(dat) {
+  if (!nrow(dat)) return(dat)
+  dat %>%
+    dplyr::group_by(cohort, stage, taxon_axis) %>%
+    dplyr::mutate(
+      repeated_label = dplyr::n() > 1,
+      axis_label = ifelse(repeated_label, paste0(taxon_axis, " -- ", predictor_value), taxon_axis)
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::group_by(cohort, stage) %>%
+    dplyr::arrange(estimate, .by_group = TRUE) %>%
+    dplyr::mutate(panel_order = dplyr::row_number()) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      row_id = paste0("hit_", dplyr::row_number()),
+      row_id = factor(row_id, levels = row_id)
+    )
+}
+
+make_empty_taxon_panels <- function(dat, cohort_levels, stage_levels, message_text) {
+  grid <- tidyr::expand_grid(
+    cohort = factor(cohort_levels, levels = cohort_levels),
+    stage = factor(stage_levels, levels = stage_levels)
+  )
+  occupied <- dat %>% dplyr::distinct(cohort, stage)
+  empty <- dplyr::anti_join(grid, occupied, by = c("cohort", "stage"))
+  if (!nrow(empty)) {
+    return(tibble(
+      cohort = factor(character(0), levels = cohort_levels),
+      stage = factor(character(0), levels = stage_levels),
+      row_id = factor(character(0)),
+      estimate = numeric(0),
+      axis_label = character(0),
+      panel_message = character(0)
+    ))
+  }
+  empty %>%
+    dplyr::mutate(
+      row_id = factor(
+        paste0("empty_", as.integer(cohort), "_", as.integer(stage)),
+        levels = paste0("empty_", as.integer(cohort), "_", as.integer(stage))
+      ),
+      estimate = 0,
+      axis_label = "",
+      panel_message = message_text
+    )
+}
+
+colour_values_for_data <- function(keys) {
+  values <- ASSOCIATION_COLORS
+  missing_keys <- setdiff(unique(stats::na.omit(keys)), names(values))
+  if (length(missing_keys)) {
+    values <- c(values, stats::setNames(rep("#B3B3B3", length(missing_keys)), missing_keys))
+  }
+  values
+}
+
+# Diagnostic helper returning the exact data used in the main FDR figure.
+get_fdr_taxa <- function(df, q_threshold = FDR_THRESHOLD) {
+  prepared <- prepare_maaslin_plot_data(df)
+  if (!nrow(prepared)) return(tibble())
+  prepared %>%
+    dplyr::filter(is.finite(q), q <= q_threshold) %>%
+    add_unique_axis_rows()
+}
+
+plot_fdr_taxa <- function(df, filename = "taxa_fdr_significant_main") {
+  prepared <- prepare_maaslin_plot_data(df)
+  if (!nrow(prepared)) {
+    message("No MaAsLin2 results available; main FDR figure not written.")
+    return(NULL)
+  }
+  dat <- get_fdr_taxa(df, q_threshold = FDR_THRESHOLD)
+
+  save_table(dat, paste0(filename, "_data.csv"))
+  if (!nrow(dat)) {
+    message(paste0("No taxon-level associations passed q <= ", FDR_THRESHOLD, "; main FDR figure not written."))
+    return(NULL)
+  }
+
+  cohort_levels <- c("Community cohort", "Student cohort")
+  stage_levels <- c("Stage 1", "Stage 2")
+  empty <- make_empty_taxon_panels(dat, cohort_levels, stage_levels, paste0("No associations at q <= ", FDR_THRESHOLD))
+  axis_labels <- c(
+    stats::setNames(dat$axis_label, as.character(dat$row_id)),
+    if (nrow(empty)) stats::setNames(empty$axis_label, as.character(empty$row_id)) else character(0)
+  )
+
+  q_dat <- dat %>%
+    dplyr::mutate(
+      q_label = paste0("q=", formatC(q, format = "f", digits = 3)),
+      q_hjust = ifelse(estimate >= 0, -0.12, 1.12)
+    )
+
+  p <- ggplot() +
+    geom_blank(data = empty, aes(x = estimate, y = row_id)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+    geom_errorbar(
+      data = q_dat,
+      aes(xmin = conf_low, xmax = conf_high, y = row_id, colour = colour_key),
+      orientation = "y", width = 0.16, linewidth = 0.35
+    ) +
+    geom_point(
+      data = q_dat,
+      aes(x = estimate, y = row_id, colour = colour_key, shape = association_type),
+      size = 2.4
+    ) +
+    geom_text(
+      data = q_dat,
+      aes(x = estimate, y = row_id, label = q_label, hjust = q_hjust),
+      colour = "grey25", size = 2.5, show.legend = FALSE
+    ) +
+    geom_text(
+      data = empty,
+      aes(x = estimate, y = row_id, label = panel_message),
+      colour = "grey45", size = 3, fontface = "italic"
+    ) +
+    facet_grid(cohort ~ stage, scales = "free_y", space = "fixed", drop = FALSE) +
+    scale_y_discrete(labels = axis_labels) +
+    scale_colour_manual(values = colour_values_for_data(q_dat$colour_key), drop = FALSE) +
+    scale_shape_manual(values = c(Preference = 16, Covariate = 17), drop = FALSE) +
+    scale_x_continuous(expand = expansion(mult = c(0.12, 0.24))) +
+    coord_cartesian(clip = "off") +
+    labs(x = "MaAsLin2 coefficient", y = "Taxon", colour = "Association", shape = "Term type") +
+    fig_theme(base_size = 9)
+
+  panel_counts <- dat %>% dplyr::count(cohort, stage)
+  max_rows <- max(c(panel_counts$n, 1L), na.rm = TRUE)
+  height <- max(6.4, 2.8 + 2 * 0.38 * max_rows)
+
+  panel_status <- tidyr::expand_grid(cohort = cohort_levels, stage = stage_levels) %>%
+    dplyr::left_join(panel_counts, by = c("cohort", "stage")) %>%
+    dplyr::mutate(n = tidyr::replace_na(n, 0L))
+  save_table(panel_status, paste0(filename, "_panel_status.csv"))
+  save_figure(p, filename, width = 10.2, height = height)
+  p
+}
+
+plot_nominal_taxa <- function(df, level_to_plot, filename, n_per_panel = TOP_NOMINAL_PER_PANEL) {
+  prepared <- prepare_maaslin_plot_data(df)
+  if (!nrow(prepared)) {
+    message("No MaAsLin2 results available; nominal ", level_to_plot, " figure not written.")
+    return(NULL)
+  }
+  all_level <- prepared %>%
+    dplyr::filter(as.character(level) == stringr::str_to_title(level_to_plot))
+
+  if (!nrow(all_level)) {
+    message("No ", level_to_plot, " results are available.")
+    return(NULL)
+  }
+
+  dat_all <- all_level %>%
+    dplyr::filter(association_type == "Preference", p < NOMINAL_THRESHOLD)
+  save_table(dat_all, paste0(filename, "_all_nominal.csv"))
+
+  if (!nrow(dat_all)) {
+    message("No nominal preference associations available for ", level_to_plot, ".")
+    return(NULL)
+  }
+
+  dat <- dat_all %>%
+    dplyr::group_by(cohort, stage) %>%
+    dplyr::arrange(p, dplyr::desc(abs(estimate)), .by_group = TRUE) %>%
+    dplyr::slice_head(n = n_per_panel) %>%
+    dplyr::ungroup() %>%
+    add_unique_axis_rows()
+
+  save_table(dat, paste0(filename, "_data.csv"))
+
+  cohort_levels <- levels(droplevels(all_level$cohort))
+  if (!length(cohort_levels)) cohort_levels <- unique(as.character(dat$cohort))
+  stage_levels <- c("Stage 1", "Stage 2")
+  empty <- make_empty_taxon_panels(dat, cohort_levels, stage_levels, "No nominal preference associations")
+  axis_labels <- c(
+    stats::setNames(dat$axis_label, as.character(dat$row_id)),
+    if (nrow(empty)) stats::setNames(empty$axis_label, as.character(empty$row_id)) else character(0)
+  )
+
+  p <- ggplot() +
+    geom_blank(data = empty, aes(x = estimate, y = row_id)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+    geom_point(
+      data = dat,
+      aes(x = estimate, y = row_id, colour = predictor),
+      size = 2.2, alpha = 0.95
+    ) +
+    geom_text(
+      data = empty,
+      aes(x = estimate, y = row_id, label = panel_message),
+      colour = "grey45", size = 3, fontface = "italic"
+    ) +
+    facet_grid(cohort ~ stage, scales = "free_y", space = "fixed", drop = FALSE) +
+    scale_y_discrete(labels = axis_labels) +
+    scale_colour_manual(values = PREFERENCE_COLORS, drop = FALSE) +
+    scale_x_continuous(expand = expansion(mult = c(0.10, 0.12))) +
+    labs(x = "MaAsLin2 coefficient", y = "Taxon", colour = "Preference") +
+    fig_theme(base_size = 8)
+
+  panel_counts <- dat %>% dplyr::count(cohort, stage)
+  max_rows <- max(c(panel_counts$n, 1L), na.rm = TRUE)
+  n_cohort_rows <- max(length(cohort_levels), 1L)
+  height <- max(5.4, 2.6 + n_cohort_rows * 0.29 * max_rows)
+
+  save_figure(p, filename, width = 10.0, height = height, out_dir = SUPP_DIR)
+  p
+}
+```
+
+```{r taxon-fdr-diagnostics}
+taxa_fdr <- get_fdr_taxa(maaslin_results)
+taxon_fdr_diagnostics <- if (nrow(taxa_fdr)) {
+  taxa_fdr %>%
+    dplyr::count(cohort, stage, level, association_type, name = "n_associations")
+} else {
+  tibble(
+    cohort = character(0), stage = character(0), level = character(0),
+    association_type = character(0), n_associations = integer(0)
+  )
+}
+knitr::kable(taxon_fdr_diagnostics)
+save_table(taxon_fdr_diagnostics, "taxa_fdr_significant_main_diagnostics.csv")
+```
+
+```{r taxon-main-fdr-figure}
+p_taxa_fdr <- plot_fdr_taxa(maaslin_results, "taxa_fdr_significant_main")
+p_taxa_fdr
+```
+
+```{r taxon-exploratory-supplement}
+p_taxa_nominal_family <- plot_nominal_taxa(
+  maaslin_results, "Family", "taxa_nominal_family_supplement"
+)
+p_taxa_nominal_genus <- plot_nominal_taxa(
+  maaslin_results, "Genus", "taxa_nominal_genus_supplement"
+)
+p_taxa_nominal_species <- if (RUN_SPECIES_MAASLIN || any(tolower(maaslin_results$level) == "species")) {
+  plot_nominal_taxa(maaslin_results, "Species", "taxa_nominal_species_supplement")
+} else NULL
+
+p_taxa_nominal_family
+p_taxa_nominal_genus
+p_taxa_nominal_species
+```
+
+```{r taxon-association-summary}
+taxon_plot_data_all <- prepare_maaslin_plot_data(maaslin_results)
+
+if (nrow(taxon_plot_data_all)) {
+  taxon_association_summary <- taxon_plot_data_all %>%
+    dplyr::summarise(
+      n_results = dplyr::n(),
+      n_fdr_total = sum(q <= FDR_THRESHOLD, na.rm = TRUE),
+      n_fdr_preferences = sum(q <= FDR_THRESHOLD & association_type == "Preference", na.rm = TRUE),
+      n_fdr_covariates = sum(q <= FDR_THRESHOLD & association_type == "Covariate", na.rm = TRUE),
+      n_nominal_preferences = sum(p < NOMINAL_THRESHOLD & association_type == "Preference", na.rm = TRUE)
+    )
+} else {
+  taxon_association_summary <- tibble(
+    n_results = 0L,
+    n_fdr_total = 0L,
+    n_fdr_preferences = 0L,
+    n_fdr_covariates = 0L,
+    n_nominal_preferences = 0L
+  )
+}
+
+knitr::kable(taxon_association_summary)
+save_table(taxon_association_summary, "taxon_association_summary.csv")
+```
+
+# 8. Community-cohort metabolomics
+
+Metabolite models use the same Stage 2 design logic as the taxon-level models. Benjamini--Hochberg correction is applied across metabolites separately for each model term. The forest plot displays standardized-outcome coefficients for the strongest self-control associations and retains 3-IAA if it is present, without hard-coding its significance. Raw-scale coefficients remain available in the exported table.
+
+```{r metabolomics-functions}
+load_metabolome <- function() {
+  path <- file.path(DATA_DIR, cohort_config$community$metabolome_file)
+  if (!file.exists(path)) return(NULL)
+  e <- new.env(parent = emptyenv())
+  load(path, envir = e)
+  if (!exists("mtblo", envir = e, inherits = FALSE)) {
+    stop("Expected object 'mtblo' in ", path)
+  }
+  as.data.frame(get("mtblo", envir = e), check.names = FALSE)
+}
+
+align_metabolome_to_meta <- function(mtb, meta) {
+  mtb <- as.data.frame(mtb, check.names = FALSE)
+  meta_ids <- coerce_id(rownames(meta))
+  row_ids <- coerce_id(rownames(mtb))
+  col_ids <- coerce_id(colnames(mtb))
+  row_common <- intersect(meta_ids, row_ids)
+  col_common <- intersect(meta_ids, col_ids)
+
+  if (length(row_common) >= length(col_common) && length(row_common) > 0) {
+    common <- row_common
+    mtb2 <- mtb[match(common, row_ids), , drop = FALSE]
+  } else if (length(col_common) > 0) {
+    mtb_t <- as.data.frame(t(as.matrix(mtb)), check.names = FALSE)
+    row_ids_t <- coerce_id(rownames(mtb_t))
+    common <- intersect(meta_ids, row_ids_t)
+    mtb2 <- mtb_t[match(common, row_ids_t), , drop = FALSE]
+  } else {
+    stop("No shared sample IDs between metabolomics and Community-cohort metadata.")
+  }
+
+  meta2 <- meta[match(common, meta_ids), , drop = FALSE]
+  rownames(meta2) <- common
+  rownames(mtb2) <- common
+  names(mtb2) <- make.unique(names(mtb2))
+  list(metabolites = mtb2, meta = meta2, common = common)
+}
+
+run_metabolomics_analysis <- function(mtb, meta) {
+  if (is.null(mtb)) return(tibble())
+  aligned <- align_metabolome_to_meta(mtb, meta)
+  mtb2 <- aligned$metabolites
+  mtb2[] <- lapply(mtb2, numify)
+
+  keep_metabolites <- vapply(mtb2, function(x) {
+    y <- as.numeric(x)
+    sum(is.finite(y)) >= 5 && stats::sd(y, na.rm = TRUE) > 0
+  }, logical(1))
+  mtb2 <- mtb2[, keep_metabolites, drop = FALSE]
+
+  design <- build_model_design(aligned$meta, "community", "stage2", include_preferences = TRUE)
+  cc <- stats::complete.cases(design)
+  design <- drop_unused_factor_levels(design[cc, , drop = FALSE])
+  mtb2 <- mtb2[rownames(design), , drop = FALSE]
+  write_design_audit(design, "community", "metabolomics", "stage2", phase = "final")
+
+  if (nrow(design) < 5 || ncol(design) < 1 || ncol(mtb2) < 1) return(tibble())
+
+  result <- purrr::map_dfr(names(mtb2), function(metabolite_name) {
+    y <- numify(mtb2[[metabolite_name]])
+    y_sd <- stats::sd(y, na.rm = TRUE)
+    if (sum(is.finite(y)) < 5 || !is.finite(y_sd) || y_sd == 0) return(tibble())
+    dat <- dplyr::bind_cols(tibble(y = y), design)
+    fit <- tryCatch(
+      stats::lm(stats::reformulate(names(design), response = "y"), data = dat, na.action = stats::na.omit),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) return(tibble())
+    broom::tidy(fit, conf.int = TRUE) %>%
+      dplyr::mutate(
+        metabolite = metabolite_name,
+        cohort = "Community cohort",
+        stage = "stage2",
+        n_samples = stats::nobs(fit),
+        model_terms = paste(names(design), collapse = "; "),
+        outcome_sd = y_sd,
+        estimate_std = dplyr::if_else(term == "(Intercept)", NA_real_, estimate / y_sd),
+        std_error_std = dplyr::if_else(term == "(Intercept)", NA_real_, std.error / y_sd),
+        conf_low_std = dplyr::if_else(term == "(Intercept)", NA_real_, conf.low / y_sd),
+        conf_high_std = dplyr::if_else(term == "(Intercept)", NA_real_, conf.high / y_sd)
+      )
+  })
+
+  if (nrow(result)) {
+    result <- result %>%
+      dplyr::group_by(term) %>%
+      dplyr::mutate(q_term = stats::p.adjust(p.value, method = "BH")) %>%
+      dplyr::ungroup()
+  }
+  result
+}
+
+pretty_metabolite <- function(x) {
+  x <- as.character(x)
+  x <- stringr::str_replace_all(x, "^X3_IAA$|^3_IAA$|^IAA$", "3-IAA")
+  x <- stringr::str_replace_all(x, "^t4_OH_Pro$", "trans-4-hydroxyproline")
+  x <- stringr::str_replace_all(x, "Cer_d18_1_20_0", "Cer(d18:1/20:0)")
+  x <- stringr::str_replace_all(x, "DG_18_1_20_3", "DG(18:1/20:3)")
+  x <- stringr::str_replace_all(x, "_", ":")
+  x
+}
+
+plot_metabolite_selfcontrol <- function(results, filename = "metabolite_selfcontrol_forest_publication", top_n = 10) {
+  if (is.null(results) || !nrow(results)) return(NULL)
+  dat <- results %>%
+    janitor::clean_names() %>%
+    dplyr::filter(term == "z_selfcontrol") %>%
+    dplyr::mutate(
+      is_iaa = stringr::str_detect(stringr::str_to_lower(metabolite), "x3_iaa|3_iaa|3-iaa|indole.?3.?acetic|^iaa$"),
+      metabolite_label = pretty_metabolite(metabolite),
+      rank_metric = dplyr::coalesce(q_term, p_value),
+      highlight = ifelse(is_iaa, "3-IAA", "Other metabolites")
+    ) %>%
+    dplyr::filter(
+      is.finite(estimate_std), is.finite(conf_low_std), is.finite(conf_high_std),
+      is.finite(p_value)
+    )
+
+  if (!nrow(dat)) return(NULL)
+  top <- dat %>%
+    dplyr::arrange(rank_metric, p_value, dplyr::desc(abs(estimate_std))) %>%
+    dplyr::slice_head(n = top_n)
+  if (any(dat$is_iaa) && !any(top$is_iaa)) {
+    top <- dplyr::bind_rows(top, dat %>% dplyr::filter(is_iaa) %>% dplyr::arrange(rank_metric, p_value) %>% dplyr::slice_head(n = 1))
+  }
+  top <- top %>%
+    dplyr::distinct(metabolite, .keep_all = TRUE) %>%
+    dplyr::mutate(metabolite_f = forcats::fct_reorder(metabolite_label, estimate_std))
+
+  p <- ggplot(top, aes(x = estimate_std, y = metabolite_f, colour = highlight)) +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.35) +
+    geom_errorbar(
+      aes(xmin = conf_low_std, xmax = conf_high_std),
+      orientation = "y", width = 0.16, linewidth = 0.35
+    ) +
+    geom_point(size = 2.2) +
+    scale_colour_manual(values = METABOLITE_COLORS, drop = FALSE) +
+    labs(x = "Coefficient per metabolite SD", y = "Metabolite", colour = NULL) +
+    fig_theme(base_size = 9)
+
+  save_figure(p, filename, width = 6.8, height = 4.8)
+  save_table(top %>% dplyr::select(-metabolite_f), paste0(filename, "_data.csv"))
+  p
+}
+```
+
+```{r metabolomics-analysis}
+if (RUN_METABOLOMICS) {
+  metabolomics_results <- run_metabolomics_analysis(load_metabolome(), meta_community)
+} else {
+  source_file <- if (!is.null(SOURCE_RUN_DIR)) file.path(SOURCE_RUN_DIR, "tables", "metabolomics_all.csv") else NA_character_
+  if (!is.na(source_file) && file.exists(source_file)) {
+    metabolomics_results <- readr::read_csv(source_file, show_col_types = FALSE)
+  } else {
+    metabolomics_results <- tibble()
+    warning("Metabolomics was not run and no valid source result was supplied.", call. = FALSE)
+  }
+}
+
+if (nrow(metabolomics_results)) {
+  save_table(metabolomics_results, "metabolomics_all.csv")
+  metabolomics_dir <- file.path(RESULTS_DIR, "hamburg")
+  dir.create(metabolomics_dir, recursive = TRUE, showWarnings = FALSE)
+  readr::write_delim(
+    metabolomics_results,
+    file.path(metabolomics_dir, "metabolomics_semicolon.csv"),
+    delim = ";", na = ""
+  )
+}
+
+metabolomics_fdr_hits <- if (nrow(metabolomics_results)) {
+  metabolomics_results %>%
+    dplyr::filter(startsWith(term, "z_"), is.finite(q_term), q_term <= FDR_THRESHOLD) %>%
+    dplyr::arrange(q_term, p.value)
+} else {
+  tibble()
+}
+
+metabolomics_summary <- tibble(
+  n_metabolites = if (nrow(metabolomics_results)) dplyr::n_distinct(metabolomics_results$metabolite) else 0L,
+  n_model_rows = nrow(metabolomics_results),
+  n_preference_fdr_hits = nrow(metabolomics_fdr_hits),
+  iaa_present = if (nrow(metabolomics_results)) any(
+    stringr::str_detect(
+      stringr::str_to_lower(metabolomics_results$metabolite),
+      "x3_iaa|3_iaa|3-iaa|indole.?3.?acetic|^iaa$"
+    )
+  ) else FALSE
+)
+
+save_table(metabolomics_fdr_hits, "metabolomics_preference_fdr_hits.csv")
+save_table(metabolomics_summary, "metabolomics_summary.csv")
+knitr::kable(metabolomics_fdr_hits)
+knitr::kable(metabolomics_summary)
+```
+
+```{r metabolomics-figure}
+p_metabolite_selfcontrol <- plot_metabolite_selfcontrol(metabolomics_results)
+p_metabolite_selfcontrol
+```
+
+# 9. Harmonized Bacillota/Bacteroidota ratio
+
+The Bacillota/Bacteroidota ratio is retained as a secondary exploratory analysis. It is calculated independently in each cohort from the corresponding rarefied **phylum-level** abundance table. Historical phylum names are harmonized (`Firmicutes` to `Bacillota`; `Bacteroidetes` to `Bacteroidota`). The inferential outcome is the natural logarithm of the ratio after adding a transparent 0.5-count pseudocount to both phyla; the untransformed ratio is also exported for descriptive use. The same Stage 1 and Stage 2 covariate structures are used as in the other within-cohort models. A null result is retained and reported rather than used as a reason to omit the analysis.
+
+```{r fb-ratio-functions}
+FB_PSEUDOCOUNT <- 0.5
+
+phylum_token_match <- function(labels, token) {
+  labels <- stringr::str_to_lower(as.character(labels))
+  labels <- stringr::str_replace_all(labels, "firmicutes", "bacillota")
+  labels <- stringr::str_replace_all(labels, "bacteroidetes", "bacteroidota")
+  stringr::str_detect(labels, paste0("(^|[^a-z])", token, "([^a-z]|$)"))
+}
+
+prepare_fb_ratio <- function(phylum_mat, meta, cohort_key, source_file) {
+  if (is.null(phylum_mat) || !nrow(phylum_mat) || !ncol(phylum_mat)) {
+    stop("Phylum table is empty for ", cohort_key, ".", call. = FALSE)
+  }
+
+  taxa <- rownames(phylum_mat)
+  bacillota_ix <- phylum_token_match(taxa, "bacillota")
+  bacteroidota_ix <- phylum_token_match(taxa, "bacteroidota")
+
+  if (!any(bacillota_ix) || !any(bacteroidota_ix)) {
+    stop(
+      "Could not identify both Bacillota and Bacteroidota in the phylum table for ",
+      cohort_key, ". Bacillota rows: ", sum(bacillota_ix),
+      "; Bacteroidota rows: ", sum(bacteroidota_ix),
+      call. = FALSE
+    )
+  }
+
+  aligned <- align_feature_to_meta(phylum_mat, meta)
+  mat <- aligned$feature
+
+  bacillota_count <- colSums(mat[bacillota_ix, , drop = FALSE], na.rm = TRUE)
+  bacteroidota_count <- colSums(mat[bacteroidota_ix, , drop = FALSE], na.rm = TRUE)
+  total_count <- colSums(mat, na.rm = TRUE)
+
+  data <- tibble(
+    sample_id = aligned$common,
+    cohort = cohort_config[[cohort_key]]$cohort,
+    cohort_key = cohort_key,
+    bacillota_count = as.numeric(bacillota_count),
+    bacteroidota_count = as.numeric(bacteroidota_count),
+    total_phylum_count = as.numeric(total_count),
+    bacillota_relative = dplyr::if_else(total_count > 0, bacillota_count / total_count, NA_real_),
+    bacteroidota_relative = dplyr::if_else(total_count > 0, bacteroidota_count / total_count, NA_real_),
+    fb_ratio_raw = dplyr::if_else(bacteroidota_count > 0, bacillota_count / bacteroidota_count, NA_real_),
+    fb_ratio_pseudocount = (bacillota_count + FB_PSEUDOCOUNT) / (bacteroidota_count + FB_PSEUDOCOUNT),
+    log_fb_ratio = log(fb_ratio_pseudocount),
+    source_file = source_file
+  )
+
+  diagnostics <- tibble(
+    cohort = cohort_config[[cohort_key]]$cohort,
+    cohort_key = cohort_key,
+    source_file = source_file,
+    n_samples = nrow(data),
+    n_bacillota_rows = sum(bacillota_ix),
+    n_bacteroidota_rows = sum(bacteroidota_ix),
+    bacillota_labels = paste(taxa[bacillota_ix], collapse = " | "),
+    bacteroidota_labels = paste(taxa[bacteroidota_ix], collapse = " | "),
+    n_zero_bacillota = sum(data$bacillota_count == 0, na.rm = TRUE),
+    n_zero_bacteroidota = sum(data$bacteroidota_count == 0, na.rm = TRUE),
+    n_finite_log_ratio = sum(is.finite(data$log_fb_ratio))
+  )
+
+  list(data = data, diagnostics = diagnostics)
+}
+
+run_fb_preference_models <- function(fb_df, meta, cohort_key, stage_label) {
+  if (is.null(fb_df) || !nrow(fb_df)) return(tibble())
+
+  common <- intersect(fb_df$sample_id, rownames(meta))
+  if (length(common) < 5) return(tibble())
+
+  meta2 <- meta[match(common, rownames(meta)), , drop = FALSE]
+  rownames(meta2) <- common
+  fb2 <- fb_df[match(common, fb_df$sample_id), , drop = FALSE]
+
+  design <- build_model_design(
+    meta2,
+    cohort_key = cohort_key,
+    stage = stage_label,
+    include_preferences = TRUE
+  )
+  fb2 <- fb2[match(rownames(design), fb2$sample_id), , drop = FALSE]
+
+  dat <- dplyr::bind_cols(
+    tibble(outcome_value = numify(fb2$log_fb_ratio)),
+    design
+  )
+  pref_terms <- preference_terms(meta2)
+
+  fit <- tryCatch(
+    stats::lm(
+      stats::reformulate(names(design), response = "outcome_value"),
+      data = dat,
+      na.action = stats::na.omit
+    ),
+    error = function(e) {
+      warning(
+        "Bacillota/Bacteroidota model failed for ", cohort_key, "/", stage_label,
+        ": ", conditionMessage(e), call. = FALSE
+      )
+      NULL
+    }
+  )
+  if (is.null(fit)) return(tibble())
+
+  broom::tidy(fit, conf.int = TRUE) %>%
+    dplyr::mutate(
+      cohort = cohort_config[[cohort_key]]$cohort,
+      cohort_key = cohort_key,
+      stage = stage_label,
+      outcome = "log(Bacillota/Bacteroidota)",
+      n_samples = stats::nobs(fit),
+      pseudocount = FB_PSEUDOCOUNT,
+      model_terms = paste(names(design), collapse = "; "),
+      is_preference = term %in% pref_terms
+    )
+}
+```
+
+```{r fb-ratio-analysis}
+if (RUN_FB_RATIO) {
+
+  fb_community_obj <- prepare_fb_ratio(
+    features$community_phylum,
+    meta_community,
+    "community",
+    cohort_config$community$rarefied_tables$phylum
+  )
+
+  fb_student_obj <- prepare_fb_ratio(
+    features$student_phylum,
+    meta_student,
+    "student",
+    cohort_config$student$rarefied_tables$phylum
+  )
+
+  fb_ratio_data <- dplyr::bind_rows(
+    fb_community_obj$data,
+    fb_student_obj$data
+  )
+
+  fb_ratio_diagnostics <- dplyr::bind_rows(
+    fb_community_obj$diagnostics,
+    fb_student_obj$diagnostics
+  )
+
+  fb_model_results_raw <- dplyr::bind_rows(
+    run_fb_preference_models(
+      fb_community_obj$data,
+      meta_community,
+      "community",
+      "stage1"
+    ),
+    run_fb_preference_models(
+      fb_community_obj$data,
+      meta_community,
+      "community",
+      "stage2"
+    ),
+    run_fb_preference_models(
+      fb_student_obj$data,
+      meta_student,
+      "student",
+      "stage1"
+    ),
+    run_fb_preference_models(
+      fb_student_obj$data,
+      meta_student,
+      "student",
+      "stage2"
+    )
+  )
+
+  fb_preference_adjusted <- fb_model_results_raw %>%
+    dplyr::filter(is_preference, is.finite(p.value)) %>%
+    dplyr::group_by(cohort, stage) %>%
+    dplyr::mutate(
+      q_fb = stats::p.adjust(p.value, method = "BH")
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(cohort, stage, term, q_fb)
+
+  fb_model_results <- fb_model_results_raw %>%
+    dplyr::left_join(
+      fb_preference_adjusted,
+      by = c("cohort", "stage", "term")
+    )
+
+  fb_preference_results <- fb_model_results %>%
+    dplyr::filter(is_preference) %>%
+    dplyr::mutate(
+      preference = unname(PREFERENCE_LABELS[term]),
+      preference = dplyr::if_else(
+        is.na(preference),
+        term,
+        preference
+      )
+    )
+
+  fb_preference_summary <- fb_preference_results %>%
+    dplyr::group_by(cohort, stage) %>%
+    dplyr::summarise(
+      n_tests = dplyr::n(),
+      n_nominal = sum(
+        p.value < NOMINAL_THRESHOLD,
+        na.rm = TRUE
+      ),
+      n_fdr = sum(
+        q_fb <= FDR_THRESHOLD,
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+
+  fb_preference_fdr_hits <- fb_preference_results %>%
+    dplyr::filter(
+      is.finite(q_fb),
+      q_fb <= FDR_THRESHOLD
+    ) %>%
+    dplyr::arrange(q_fb, p.value)
+
+  save_table(
+    fb_ratio_data,
+    "fb_ratio_harmonized_sample_data.csv"
+  )
+
+  save_table(
+    fb_ratio_diagnostics,
+    "fb_ratio_harmonized_diagnostics.csv"
+  )
+
+  save_table(
+    fb_model_results,
+    "fb_ratio_stage1_stage2_all.csv"
+  )
+
+  save_table(
+    fb_preference_results,
+    "fb_ratio_preference_associations.csv"
+  )
+
+  save_table(
+    fb_preference_summary,
+    "fb_ratio_preference_summary.csv"
+  )
+
+  save_table(
+    fb_preference_fdr_hits,
+    "fb_ratio_preference_fdr_hits.csv"
+  )
+
+  fb_plot_df <- fb_preference_results %>%
+    dplyr::filter(
+      is.finite(estimate),
+      is.finite(conf.low),
+      is.finite(conf.high)
+    ) %>%
+    dplyr::mutate(
+      cohort = factor(
+        cohort,
+        levels = c(
+          "Community cohort",
+          "Student cohort"
+        )
+      ),
+      stage_label = factor(
+        stage,
+        levels = c("stage1", "stage2"),
+        labels = c("Stage 1", "Stage 2")
+      ),
+      preference = factor(
+        preference,
+        levels = names(PREFERENCE_COLORS)
+      ),
+      nominal = p.value < NOMINAL_THRESHOLD
+    )
+
+  if (nrow(fb_plot_df) > 0) {
+
+    p_fb_ratio_preferences <- ggplot(
+      fb_plot_df,
+      aes(
+        x = estimate,
+        y = forcats::fct_reorder(preference, estimate),
+        colour = preference,
+        shape = nominal
+      )
+    ) +
+      geom_vline(
+        xintercept = 0,
+        linetype = 2,
+        colour = "grey60"
+      ) +
+      geom_errorbar(
+        aes(
+          xmin = conf.low,
+          xmax = conf.high
+        ),
+        orientation = "y",
+        width = 0.16
+      ) +
+      geom_point(size = 2.0) +
+      facet_grid(
+        cohort ~ stage_label,
+        scales = "free_y",
+        drop = FALSE
+      ) +
+      scale_colour_manual(
+        values = PREFERENCE_COLORS,
+        drop = FALSE
+      ) +
+      scale_shape_manual(
+        values = c(
+          `FALSE` = 1,
+          `TRUE` = 16
+        ),
+        labels = c(
+          `FALSE` = paste0(
+            "P >= ",
+            NOMINAL_THRESHOLD
+          ),
+          `TRUE` = paste0(
+            "P < ",
+            NOMINAL_THRESHOLD
+          )
+        )
+      ) +
+      labs(
+        x = "Coefficient for log Bacillota/Bacteroidota ratio",
+        y = NULL,
+        colour = "Preference",
+        shape = "Nominal association"
+      ) +
+      fig_theme(base_size = 8.5)
+
+    save_figure(
+      p_fb_ratio_preferences,
+      "fb_ratio_preference_associations_supplement",
+      width = 9.4,
+      height = 7.2,
+      out_dir = SUPP_DIR
+    )
+
+    print(p_fb_ratio_preferences)
+
+  } else {
+
+    p_fb_ratio_preferences <- NULL
+    message(
+      "No finite Bacillota/Bacteroidota preference estimates available for plotting."
+    )
+  }
+
+  knitr::kable(fb_ratio_diagnostics)
+  knitr::kable(fb_preference_summary)
+  knitr::kable(fb_preference_fdr_hits)
+
+} else {
+
+  fb_ratio_data <- tibble::tibble()
+  fb_ratio_diagnostics <- tibble::tibble()
+  fb_model_results <- tibble::tibble()
+  fb_preference_results <- tibble::tibble()
+  fb_preference_summary <- tibble::tibble()
+  fb_preference_fdr_hits <- tibble::tibble()
+  p_fb_ratio_preferences <- NULL
+
+  message(
+    "Bacillota/Bacteroidota ratio analysis disabled by run_fb_ratio: false"
+  )
+}
+```
+
+# 10. Manuscript numbers and running results summary
+
+```{r manuscript-numbers}
+manuscript_numbers <- tibble(
+  quantity = c(
+    "n_community_metadata",
+    "n_student_metadata",
+    "n_community_preference_id_overlap",
+    "n_community_alpha",
+    "n_student_alpha",
+    "n_alpha_preference_fdr_hits",
+    "n_taxon_fdr_hits_total",
+    "n_taxon_fdr_preference_hits",
+    "n_fb_ratio_preference_fdr_hits",
+    "n_metabolite_preference_fdr_hits"
+  ),
+  value = c(
+    nrow(meta_community),
+    nrow(meta_student),
+    community_preference_linkage_audit$n[
+      community_preference_linkage_audit$dataset == "IDs shared by meta_dummy and preference file"
+    ],
+    sum(alpha_main$cohort == "Community cohort"),
+    sum(alpha_main$cohort == "Student cohort"),
+    nrow(alpha_preference_fdr_hits),
+    if (nrow(taxon_plot_data_all)) sum(taxon_plot_data_all$q <= FDR_THRESHOLD, na.rm = TRUE) else 0L,
+    if (nrow(taxon_plot_data_all)) sum(taxon_plot_data_all$q <= FDR_THRESHOLD & taxon_plot_data_all$association_type == "Preference", na.rm = TRUE) else 0L,
+    nrow(fb_preference_fdr_hits),
+    nrow(metabolomics_fdr_hits)
+  )
+)
+knitr::kable(manuscript_numbers)
+save_table(manuscript_numbers, "manuscript_numbers.csv")
+```
+
+```{r manuscript-summary, results='asis'}
+summary_lines <- c(
+  "## Manuscript-ready running summary",
+  "",
+  paste0("The Community cohort contains ", nrow(meta_community), " harmonized metadata records."),
+  "",
+  paste0("The Student cohort contains ", nrow(meta_student), " harmonized metadata records."),
+  "",
+  paste0("Alpha diversity is available for ", sum(alpha_main$cohort == "Community cohort"), " Community-cohort and ", sum(alpha_main$cohort == "Student cohort"), " Student-cohort samples."),
+  "",
+  paste0("The within-cohort alpha-diversity models contain ", nrow(alpha_preference_fdr_hits), " preference associations at q <= ", FDR_THRESHOLD, "."),
+  "",
+  paste0("The current MaAsLin2 output contains ", manuscript_numbers$value[manuscript_numbers$quantity == "n_taxon_fdr_hits_total"], " taxon-level associations at q <= ", FDR_THRESHOLD, ", including ", manuscript_numbers$value[manuscript_numbers$quantity == "n_taxon_fdr_preference_hits"], " preference-related associations."),
+  "",
+  paste0("The harmonized Bacillota/Bacteroidota analysis contains ", nrow(fb_preference_fdr_hits), " preference associations at q <= ", FDR_THRESHOLD, "."),
+  "",
+  paste0("The current metabolomics output contains ", nrow(metabolomics_fdr_hits), " preference-related metabolite associations at q <= ", FDR_THRESHOLD, "."),
+  "",
+  "Student cohort Stage 2 models include smoking, club membership, and alcohol-consumption frequency as categorical covariates and are checked against exact duplication of Stage 1 coefficients.",
+  "",
+  "Species-level MaAsLin2 is restricted to the Community-cohort shotgun data; Student-cohort 16S profiles are analysed at family and genus level only.",
+  "",
+  "The harmonized Bacillota/Bacteroidota ratio is retained as a secondary exploratory analysis, including when the result is null."
+)
+cat(paste(summary_lines, collapse = "\n"))
+writeLines(summary_lines, file.path(TABLES_DIR, "manuscript_running_summary.md"))
+```
+
+# 11. Output validation and session information
+
+```{r output-validation}
+critical_checks <- tibble(
+  check = c(
+    "community_metadata_loaded",
+    "student_metadata_loaded",
+    "community_preference_id_overlap_complete",
+    "community_preference_unmatched_ids_absent",
+    "cohort_description_table_written",
+    "alpha_both_cohorts",
+    "alpha_preference_models_written",
+    "student_stage2_covariates_valid",
+    "student_stage_models_not_identical",
+    "permanova_results_written",
+    "maaslin_results_written",
+    "shotgun_species_scope_valid",
+    "main_taxon_figure_written_when_hits_exist",
+    "metabolomics_results_written",
+    "fb_ratio_harmonized_generated"
+  ),
+  passed = c(
+    nrow(meta_community) > 0,
+    nrow(meta_student) > 0,
+    community_preference_linkage_audit$n[
+      community_preference_linkage_audit$dataset == "IDs shared by meta_dummy and preference file"
+    ] == community_preference_linkage_audit$n[
+      community_preference_linkage_audit$dataset == "meta_dummy"
+    ],
+    nrow(community_preference_unmatched_ids) == 0,
+    file.exists(file.path(TABLES_DIR, "cohort_description_manuscript_table1.csv")),
+    dplyr::n_distinct(alpha_main$cohort) == 2,
+    nrow(alpha_model_results) > 0 && file.exists(file.path(TABLES_DIR, "alpha_preference_associations.csv")),
+    all(LIFESTYLE_CANDIDATES_STUDENT %in% names(student_stage2_full_design)) &&
+      all(vapply(student_stage2_full_design[LIFESTYLE_CANDIDATES_STUDENT], is.factor, logical(1))) &&
+      all(vapply(student_stage2_full_design[LIFESTYLE_CANDIDATES_STUDENT], function(x) nlevels(droplevels(x)) > 1, logical(1))),
+    nrow(student_stage_comparison) > 0 && all(!student_stage_comparison$effectively_identical),
+    nrow(permanova_results) > 0,
+    nrow(maaslin_results) > 0,
+    isTRUE(species_analysis_scope$scope_valid),
+    taxon_association_summary$n_fdr_total == 0 || file.exists(file.path(FIGURES_DIR, "taxa_fdr_significant_main.pdf")),
+    nrow(metabolomics_results) > 0,
+    !RUN_FB_RATIO || (
+      nrow(fb_ratio_diagnostics) == 2 &&
+      all(fb_ratio_diagnostics$n_bacillota_rows > 0) &&
+      all(fb_ratio_diagnostics$n_bacteroidota_rows > 0) &&
+      nrow(fb_preference_results) > 0 &&
+      file.exists(file.path(TABLES_DIR, "fb_ratio_preference_associations.csv"))
+    )
+  )
+)
+
+save_table(critical_checks, "analysis_critical_checks.csv")
+knitr::kable(critical_checks)
+
+output_manifest <- tibble(
+  file = list.files(RUN_DIR, recursive = TRUE, full.names = TRUE),
+  relative_path = sub(paste0("^", normalizePath(RUN_DIR), "/?"), "", normalizePath(file, mustWork = FALSE)),
+  bytes = file.info(file)$size
+) %>%
+  dplyr::arrange(relative_path)
+save_table(output_manifest, "output_manifest.csv")
+
+ANALYSIS_CHECKS_PASSED <- all(critical_checks$passed)
+```
+
+```{r session-info}
+sink(file.path(LOG_DIR, "sessionInfo.txt"))
+print(sessionInfo())
+sink()
+sessionInfo()
+```
+
+```{r final-check-enforcement}
+if (STRICT_CHECKS && !ANALYSIS_CHECKS_PASSED) {
+  stop(
+    "One or more critical analysis checks failed: ",
+    paste(critical_checks$check[!critical_checks$passed], collapse = ", "),
+    call. = FALSE
+  )
+}
+message("Completed ", NOTEBOOK_VERSION, ". Outputs: ", RUN_DIR)
+```
